@@ -1,0 +1,36 @@
+#!/usr/bin/env bpftrace
+
+uprobe:/usr/local/qcloud/tat_agent/tat_agent:SSL_write_ex
+/comm == "tat_agent"/
+{
+  printf("AGENTSIGHT|TLS_WRITE|%d|%d|%r", pid, tid, buf(arg1, arg2));
+}
+
+uprobe:/usr/local/qcloud/tat_agent/tat_agent:SSL_read
+/comm == "tat_agent"/
+{
+  @read_buf[tid] = arg1;
+}
+
+uretprobe:/usr/local/qcloud/tat_agent/tat_agent:SSL_read
+/comm == "tat_agent" && retval > 0/
+{
+  printf("AGENTSIGHT|TLS_READ|%d|%d|%r", pid, tid, buf(@read_buf[tid], retval));
+  delete(@read_buf[tid]);
+}
+
+uprobe:/usr/local/qcloud/tat_agent/tat_agent:SSL_read_ex
+/comm == "tat_agent"/
+{
+  @read_ex_buf[tid] = arg1;
+  @read_ex_len[tid] = arg3;
+}
+
+uretprobe:/usr/local/qcloud/tat_agent/tat_agent:SSL_read_ex
+/comm == "tat_agent" && retval == 1/
+{
+  $length = *(uint64 *)@read_ex_len[tid];
+  printf("AGENTSIGHT|TLS_READ|%d|%d|%r", pid, tid, buf(@read_ex_buf[tid], $length));
+  delete(@read_ex_buf[tid]);
+  delete(@read_ex_len[tid]);
+}

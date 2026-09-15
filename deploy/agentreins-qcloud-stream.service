@@ -1,0 +1,19 @@
+[Unit]
+Description=AgentReins Tencent Cloud realtime evidence stream
+After=network-online.target agentz-kubearmor-feed.service tat_agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/agentreins/agentreins_qcloud_stream.py
+Environment=AGENTREINS_INGEST_URL=https://www.chuhaijian.com/api/agentsec/ingest
+Environment=AGENTREINS_INGEST_TOKEN_FILE=/etc/agentreins/ingest.token
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/usr/local/qcloud/tat_agent/log /var/log/journal
+
+[Install]
+WantedBy=multi-user.target

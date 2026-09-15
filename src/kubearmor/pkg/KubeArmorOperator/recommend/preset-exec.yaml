@@ -1,0 +1,15 @@
+apiVersion: security.kubearmor.com/v1
+kind: KubeArmorClusterPolicy
+metadata:
+  annotations:
+    app.kubearmor.io/source: KubeArmor Operator
+    app.kubearmor.io/type: preset
+  name: preset-exec
+spec:
+  presets:
+  - action: Audit
+    name: exec
+  message: Alert! exec operation is detected by preset rule
+  selector:
+    matchExpressions:
+  severity: 5

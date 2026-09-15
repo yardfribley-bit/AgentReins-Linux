@@ -1,0 +1,14 @@
+[Unit]
+Description=AgentSight TAT TLS plaintext probe
+After=tat_agent.service
+Requires=tat_agent.service
+
+[Service]
+Type=simple
+Environment=BPFTRACE_MAX_STRLEN=16384
+ExecStart=/usr/bin/bpftrace -f json /opt/agentreins/agentsight_tat_tls.bt
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

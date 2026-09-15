@@ -1,0 +1,76 @@
+//go:build linux
+// +build linux
+
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Authors of KubeArmor
+
+package main
+
+import (
+	"context"
+	"os"
+	"strings"
+
+	"github.com/kubearmor/KubeArmor/KubeArmor/types"
+	"go.podman.io/podman/v6/pkg/bindings"
+	"go.podman.io/podman/v6/pkg/bindings/containers"
+	"go.podman.io/podman/v6/pkg/domain/entities"
+)
+
+type podmanHandler struct {
+	conn context.Context
+}
+
+func newPodmanHandler(socket string) (*podmanHandler, error) {
+	conn, err := bindings.NewConnection(context.Background(), socket)
+	if err != nil {
+		return nil, err
+	}
+	return &podmanHandler{conn: conn}, nil
+}
+
+func (h *podmanHandler) listContainers() ([]types.Container, error) {
+
+	listOptions := &containers.ListOptions{
+		Namespace: func(b bool) *bool { return &b }(true),
+	}
+
+	containerList, err := containers.List(h.conn, listOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	var containersData []types.Container
+	for _, container := range containerList {
+		c := containerFromListContainer(container)
+		containersData = append(containersData, c)
+	}
+	return containersData, nil
+}
+
+func containerFromListContainer(container entities.ListContainer) types.Container {
+	kaContainer := types.Container{}
+
+	kaContainer.ContainerID = container.ID
+	if len(container.Names) > 0 {
+		kaContainer.ContainerName = container.Names[0]
+		kaContainer.EndPointName = container.Names[0]
+	}
+
+	hostname, _ := os.Hostname()
+	kaContainer.NamespaceName = hostname
+	// kaContainer.Privileged = container.Labels["privileged"] == "true" // Assuming a 'privileged' label is set
+	labels := []string{}
+	labels = append(labels, "namespaceName="+hostname)
+	labels = append(labels, "containerType="+"podman")
+	labels = append(labels, "kubearmor.io/container.name="+container.Names[0])
+
+	for k, v := range container.Labels {
+		labels = append(labels, k+"="+v)
+	}
+	kaContainer.Labels = strings.Join(labels, ",")
+	kaContainer.Status = container.State
+	kaContainer.PidNS, kaContainer.MntNS = getNS(container.Pid)
+
+	return kaContainer
+}

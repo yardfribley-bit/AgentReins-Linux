@@ -1,0 +1,16 @@
+apiVersion: security.kubearmor.com/v1
+kind: KubeArmorClusterPolicy
+metadata:
+  annotations:
+    app.kubearmor.io/source: KubeArmor Operator
+    app.kubearmor.io/type: preset
+  name: preset-fileexec
+spec:
+  presets:
+  - action: Block
+    name: filelessExec
+  message: Alert! Fileless exec operation is detected
+  selector:
+    matchExpressions:
+  severity: 5
+   
