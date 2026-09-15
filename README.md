@@ -14,6 +14,7 @@ AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络
 - **跨层关联**：通过时间、PID、父子关系、连接和任务 ID，把控制面、用户态与内核态串成一条链。
 - **持续追溯**：增量采集、去重、持久化并支持按组件或任务回看。
 - **秘密保护**：命令与协议内容保持原貌，仅遮盖密码、Token、Cookie、私钥等认证秘密。
+- **自然语言控制**：把中文或英文管理要求编译成可预览、可验证、可回滚的 AgentReins Policy IR，再映射到 AgentSpec、KubeArmor、eBPF 与 LSM 执行面。
 
 ## 真实证据模型
 
@@ -36,6 +37,7 @@ AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络
 
 ```text
 collector/   实时事件采集、标准化、秘密遮盖与推送
+policy/      自然语言编译、Policy IR、AgentSpec 兼容与策略验证
 deploy/      主机服务和持续运行配置
 docs/        证据报告、架构与调查方法
 scripts/     组件发现及主机检查工具
@@ -49,5 +51,18 @@ tests/       自动化验证
 2. Correlation over noise：展示行为链，而不是堆积系统调用。
 3. Observe before enforce：先建立基线，再决定阻断策略。
 4. Secrets stay protected：公开证据不等于公开控制权。
+5. Deterministic enforcement：模型理解意图，确定性编译器和验证器决定执行策略。
+
+## 自然语言策略预览
+
+```bash
+PYTHONPATH=. python3 -m policy.cli \
+  "监控 tat_agent 执行的全部命令；修改系统文件时需要确认；读取凭据时阻止" \
+  --mode enforce --format json
+```
+
+默认 `observe` 模式拒绝携带阻断或人工批准动作的策略。只有明确选择
+`--mode enforce`，并通过验证器后，策略才具备进入执行面的资格。当前版本完成
+自然语言到 Policy IR 和 AgentSpec 兼容规则的编译；内核策略下发仍保持关闭。
 
 底层运行时组件与许可证信息统一收录在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，不作为 AgentReins Linux 的产品定义。
