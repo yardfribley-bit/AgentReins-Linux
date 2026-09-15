@@ -1,0 +1,2364 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Authors of KubeArmor
+
+package feeder
+
+import (
+	"math"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"syscall"
+
+	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
+	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
+)
+
+// ======================= //
+// == Security Policies == //
+// ======================= //
+
+// GetProtocolFromName function gets protocol name from visibility data
+func GetProtocolFromName(proto string) string {
+	switch strings.ToLower(proto) {
+	case "tcp":
+		return "protocol=TCP type=SOCK_STREAM"
+	case "udp":
+		return "protocol=UDP type=SOCK_DGRAM"
+	case "icmp":
+		return "protocol=ICMP type=SOCK_RAW"
+	case "ipv6-icmp":
+		return "protocol=IPv6-ICMP type=SOCK_RAW"
+	case "sctp":
+		return "protocol=SCTP type=SOCK_STREAM|SOCK_SEQPACKET"
+	default:
+		return proto
+	}
+}
+
+func GetProtocolFromType(proto int32) string {
+	switch proto {
+	case 1:
+		return "type=SOCK_STREAM"
+	case 2:
+		return "type=SOCK_DGRAM"
+	case 3:
+		return "type=SOCK_RAW"
+	case 4:
+		return "type=SOCK_RDM"
+	case 5:
+		return "type=SOCK_SEQPACKET"
+	case 6:
+		return "type=SOCK_DCCP"
+	case 10:
+		return "type=SOCK_PACKET"
+	default:
+		return string(proto)
+	}
+}
+
+func fetchProtocol(resource string) string {
+	if strings.Contains(resource, "protocol=TCP") || (strings.Contains(resource, "SOCK_STREAM") && strings.Contains(resource, "protocol=HOPOPT")) {
+		return "tcp"
+	} else if strings.Contains(resource, "protocol=UDP") || (strings.Contains(resource, "SOCK_DGRAM") && strings.Contains(resource, "protocol=HOPOPT")) {
+		return "udp"
+	} else if strings.Contains(resource, "protocol=IPv6-ICMP") {
+		return "icmpv6"
+	} else if strings.Contains(resource, "protocol=ICMP") {
+		return "icmp"
+	} else if strings.Contains(resource, "protocol=SCTP") {
+		return "sctp"
+	} else if strings.Contains(resource, "SOCK_RAW") {
+		return "raw"
+	} else if strings.Contains(resource, "SOCK_STREAM") {
+		return "stream"
+	} else if strings.Contains(resource, "SOCK_DGRAM") {
+		return "dgram"
+	} else if strings.Contains(resource, "SOCK_RDM") {
+		return "rdm"
+	} else if strings.Contains(resource, "SOCK_SEQPACKET") {
+		return "seqpacket"
+	} else if strings.Contains(resource, "SOCK_DCCP") {
+		return "dccp"
+	} else if strings.Contains(resource, "SOCK_PACKET") {
+		return "packet"
+	}
+	return resource
+}
+
+func getFileProcessUID(path string) string {
+	info, err := os.Stat(path)
+	if err == nil {
+		stat := info.Sys().(*syscall.Stat_t)
+		uid := stat.Uid
+
+		return strconv.Itoa(int(uid))
+	}
+
+	return ""
+}
+
+// getOperationAndCapabilityFromName Function
+func getOperationAndCapabilityFromName(capName string) (op, capability string) {
+	switch strings.ToLower(capName) {
+	case "net_raw":
+		op = "Network"
+		capability = "raw" // we will remove this when we have proper handling of capabilities
+	default:
+		return "", "unknown"
+	}
+
+	return op, capability
+}
+
+var usbClass = map[uint8]string{
+	1:   "AUDIO",
+	2:   "COMMUNICATION-CDC",
+	3:   "HID",
+	5:   "PHYSICAL",
+	6:   "IMAGE",
+	7:   "PRINTER",
+	8:   "MASS-STORAGE",
+	9:   "HUB",
+	10:  "CDC-DATA",
+	11:  "SMART-CARD",
+	13:  "CONTENT-SECURITY",
+	14:  "VIDEO",
+	15:  "PERSONAL-HEALTHCARE",
+	16:  "AUDIO/VIDEO",
+	17:  "BILLBOARD",
+	18:  "TYPE-C-BRIDGE",
+	19:  "BULK-DISPLAY",
+	20:  "MCTP",
+	60:  "I3C",
+	220: "DIAGNOSTIC",
+	224: "WIRELESS-CONTROLLER",
+	239: "MISCELLANEOUS",
+	254: "APPLICATION-SPECIFIC",
+	255: "VENDOR-SPECIFIC",
+}
+
+func parseDeviceClass(class string) string {
+	class = strings.TrimSpace(class)
+
+	// try parse as decimal
+	if c, err := strconv.ParseUint(class, 10, 8); err == nil {
+		if c <= math.MaxUint8 {
+			if name, ok := usbClass[uint8(c)]; ok {
+				return name
+			}
+		}
+	}
+
+	// try parse as hex
+	if strings.HasPrefix(class, "0x") {
+		if c, err := strconv.ParseUint(class[2:], 16, 64); err == nil {
+			if c <= math.MaxUint8 {
+				if name, ok := usbClass[uint8(c)]; ok {
+					return name
+				}
+			}
+		}
+	}
+
+	return class
+}
+
+// getDeviceResource Function
+func getDeviceResource(class string, subClass, protocol *int32, level *int32) string {
+	class = parseDeviceClass(class)
+
+	res := "USB " + class
+
+	if subClass != nil {
+		res += "_" + strconv.Itoa(int(*subClass))
+	} else {
+		res += "_*"
+	}
+
+	if protocol != nil {
+		res += "_" + strconv.Itoa(int(*protocol))
+	} else {
+		res += "_*"
+	}
+
+	if level != nil {
+		res += " " + strconv.Itoa(int(*level))
+	}
+
+	return res
+}
+
+// newMatchPolicy Function
+func (fd *Feeder) newMatchPolicy(policyEnabled int, policyName, src string, mp any) tp.MatchPolicy {
+	match := tp.MatchPolicy{
+		PolicyName: policyName,
+		Source:     src,
+	}
+
+	if ppt, ok := mp.(tp.ProcessPathType); ok {
+		match.Severity = strconv.Itoa(ppt.Severity)
+		match.Tags = ppt.Tags
+		match.Message = ppt.Message
+
+		match.Operation = "Process"
+		if len(ppt.ExecName) > 0 {
+			match.Resource = ppt.ExecName
+			match.ResourceType = "ExecName"
+		} else {
+			match.Resource = ppt.Path
+			match.ResourceType = "Path"
+		}
+
+		match.OwnerOnly = ppt.OwnerOnly
+
+		if ppt.Pts != nil {
+			match.Pts = new(bool)
+			*match.Pts = *ppt.Pts
+		}
+
+		if policyEnabled == tp.KubeArmorPolicyAudited && ppt.Action == "Allow" {
+			match.Action = "Audit (" + ppt.Action + ")"
+		} else if policyEnabled == tp.KubeArmorPolicyAudited && ppt.Action == "Block" {
+			match.Action = "Audit (" + ppt.Action + ")"
+		} else {
+			match.Action = ppt.Action
+		}
+	} else if pdt, ok := mp.(tp.ProcessDirectoryType); ok {
+		match.Severity = strconv.Itoa(pdt.Severity)
+		match.Tags = pdt.Tags
+		match.Message = pdt.Message
+
+		match.Operation = "Process"
+		match.Resource = pdt.Directory
+		match.ResourceType = "Directory"
+
+		match.OwnerOnly = pdt.OwnerOnly
+		match.Recursive = pdt.Recursive
+
+		if pdt.Pts != nil {
+			match.Pts = new(bool)
+			*match.Pts = *pdt.Pts
+		}
+
+		if policyEnabled == tp.KubeArmorPolicyAudited && pdt.Action == "Allow" {
+			match.Action = "Audit (" + pdt.Action + ")"
+		} else if policyEnabled == tp.KubeArmorPolicyAudited && pdt.Action == "Block" {
+			match.Action = "Audit (" + pdt.Action + ")"
+		} else {
+			match.Action = pdt.Action
+		}
+	} else if ppt, ok := mp.(tp.ProcessPatternType); ok {
+		match.Severity = strconv.Itoa(ppt.Severity)
+		match.Tags = ppt.Tags
+		match.Message = ppt.Message
+
+		match.Operation = "Process"
+		match.Resource = ppt.Pattern
+		match.ResourceType = "" // to be defined based on the pattern matching syntax
+
+		match.OwnerOnly = ppt.OwnerOnly
+
+		if policyEnabled == tp.KubeArmorPolicyAudited && ppt.Action == "Allow" {
+			match.Action = "Audit (" + ppt.Action + ")"
+		} else if policyEnabled == tp.KubeArmorPolicyAudited && ppt.Action == "Block" {
+			match.Action = "Audit (" + ppt.Action + ")"
+		} else {
+			match.Action = ppt.Action
+		}
+	} else if fpt, ok := mp.(tp.FilePathType); ok {
+		match.Severity = strconv.Itoa(fpt.Severity)
+		match.Tags = fpt.Tags
+		match.Message = fpt.Message
+
+		match.Operation = "File"
+		match.Resource = fpt.Path
+		match.ResourceType = "Path"
+
+		match.OwnerOnly = fpt.OwnerOnly
+		match.ReadOnly = fpt.ReadOnly
+
+		if fpt.Pts != nil {
+			match.Pts = new(bool)
+			*match.Pts = *fpt.Pts
+		}
+
+		if policyEnabled == tp.KubeArmorPolicyAudited && fpt.Action == "Allow" {
+			match.Action = "Audit (" + fpt.Action + ")"
+		} else if policyEnabled == tp.KubeArmorPolicyAudited && fpt.Action == "Block" {
+			match.Action = "Audit (" + fpt.Action + ")"
+		} else {
+			match.Action = fpt.Action
+		}
+	} else if fdt, ok := mp.(tp.FileDirectoryType); ok {
+		match.Severity = strconv.Itoa(fdt.Severity)
+		match.Tags = fdt.Tags
+		match.Message = fdt.Message
+
+		match.Operation = "File"
+		match.Resource = fdt.Directory
+		match.ResourceType = "Directory"
+
+		match.OwnerOnly = fdt.OwnerOnly
+		match.ReadOnly = fdt.ReadOnly
+		match.Recursive = fdt.Recursive
+
+		if fdt.Pts != nil {
+			match.Pts = new(bool)
+			*match.Pts = *fdt.Pts
+		}
+
+		if policyEnabled == tp.KubeArmorPolicyAudited && fdt.Action == "Allow" {
+			match.Action = "Audit (" + fdt.Action + ")"
+		} else if policyEnabled == tp.KubeArmorPolicyAudited && fdt.Action == "Block" {
+			match.Action = "Audit (" + fdt.Action + ")"
+		} else {
+			match.Action = fdt.Action
+		}
+	} else if fpt, ok := mp.(tp.FilePatternType); ok {
+		match.Severity = strconv.Itoa(fpt.Severity)
+		match.Tags = fpt.Tags
+		match.Message = fpt.Message
+		match.Operation = "File"
+		match.Resource = fpt.Pattern
+		match.ResourceType = "" // to be defined based on the pattern matching syntax
+
+		match.OwnerOnly = fpt.OwnerOnly
+		match.ReadOnly = fpt.ReadOnly
+
+		if policyEnabled == tp.KubeArmorPolicyAudited && fpt.Action == "Allow" {
+			match.Action = "Audit (" + fpt.Action + ")"
+		} else if policyEnabled == tp.KubeArmorPolicyAudited && fpt.Action == "Block" {
+			match.Action = "Audit (" + fpt.Action + ")"
+		} else {
+			match.Action = fpt.Action
+		}
+	} else if npt, ok := mp.(tp.NetworkProtocolType); ok {
+		match.Severity = strconv.Itoa(npt.Severity)
+		match.Tags = npt.Tags
+		match.Message = npt.Message
+
+		match.Operation = "Network"
+		match.Resource = strings.ToLower(npt.Protocol)
+		match.ResourceType = "Protocol"
+
+		if npt.Pts != nil {
+			match.Pts = new(bool)
+			*match.Pts = *npt.Pts
+		}
+
+		// TODO: Handle cases where AppArmor network enforcement is not present
+		// https://github.com/kubearmor/KubeArmor/issues/1285
+		if policyEnabled == tp.KubeArmorPolicyAudited && npt.Action == "Allow" {
+			match.Action = "Audit (" + npt.Action + ")"
+		} else if policyEnabled == tp.KubeArmorPolicyAudited && npt.Action == "Block" {
+			match.Action = "Audit (" + npt.Action + ")"
+		} else {
+			match.Action = npt.Action
+		}
+	} else if ndns, ok := mp.(tp.MatchDNSQueryType); ok {
+		match.Severity = strconv.Itoa(ndns.Severity)
+		match.Tags = ndns.Tags
+		match.Message = ndns.Message
+
+		match.Operation = "Network"
+		match.Resource = strings.ToLower(ndns.Domain)
+		match.ResourceType = "DNS"
+
+		if policyEnabled == tp.KubeArmorPolicyAudited && ndns.Action == "Allow" {
+			match.Action = "Audit (" + ndns.Action + ")"
+		} else if policyEnabled == tp.KubeArmorPolicyAudited && ndns.Action == "Block" {
+			match.Action = "Audit (" + ndns.Action + ")"
+		} else {
+			match.Action = ndns.Action
+		}
+	} else if cct, ok := mp.(tp.CapabilitiesCapabilityType); ok {
+		match.Severity = strconv.Itoa(cct.Severity)
+		match.Tags = cct.Tags
+		match.Message = cct.Message
+		if fd.GetEnforcer() == "BPFLSM" {
+			match.Operation = "Capabilities"
+			match.Resource = strings.ToUpper(cct.Capability)
+		} else {
+			op, cap := getOperationAndCapabilityFromName(cct.Capability)
+			match.Operation = op
+			match.Resource = cap
+		}
+
+		match.ResourceType = "Capability"
+
+		if policyEnabled == tp.KubeArmorPolicyAudited && cct.Action == "Allow" {
+			match.Action = "Audit (" + cct.Action + ")"
+		} else if policyEnabled == tp.KubeArmorPolicyAudited && cct.Action == "Block" {
+			match.Action = "Audit (" + cct.Action + ")"
+		} else {
+			match.Action = cct.Action
+		}
+	} else if smt, ok := mp.(tp.SyscallMatchType); ok {
+		match.Severity = strconv.Itoa(smt.Severity)
+		match.Tags = smt.Tags
+		match.Message = smt.Message
+		match.Operation = "Syscall"
+		match.ResourceType = strings.ToUpper(smt.Syscalls[0])
+		match.Action = "Audit"
+	} else if smpt, ok := mp.(tp.SyscallMatchPathType); ok {
+		match.Severity = strconv.Itoa(smpt.Severity)
+		match.Tags = smpt.Tags
+		match.Message = smpt.Message
+		match.Action = "Audit"
+		match.Operation = "Syscall"
+		match.Resource = smpt.Path
+		match.ResourceType = strings.ToUpper(smpt.Syscalls[0])
+
+	} else if dmt, ok := mp.(tp.DeviceMatchType); ok {
+		match.Severity = strconv.Itoa(dmt.Severity)
+		match.Tags = dmt.Tags
+		match.Message = dmt.Message
+		match.Operation = "Device"
+		match.Action = dmt.Action
+		match.Resource = getDeviceResource(dmt.Class, dmt.SubClass, dmt.Protocol, dmt.Level)
+		match.ResourceType = "USB Device"
+	} else if ing, ok := mp.(tp.IngressType); ok {
+		match.Severity = strconv.Itoa(ing.Severity)
+		match.Tags = ing.Tags
+		match.Message = ing.Message
+		match.Operation = "NetworkFirewall"
+		match.Action = ing.Action
+		match.Resource = ""
+		match.ResourceType = "Ingress"
+	} else if egr, ok := mp.(tp.EgressType); ok {
+		match.Severity = strconv.Itoa(egr.Severity)
+		match.Tags = egr.Tags
+		match.Message = egr.Message
+		match.Operation = "NetworkFirewall"
+		match.Action = egr.Action
+		match.Resource = ""
+		match.ResourceType = "Egress"
+	} else {
+		return tp.MatchPolicy{}
+	}
+
+	return match
+}
+
+// UpdateSecurityPolicies Function
+func (fd *Feeder) UpdateSecurityPolicies(action string, endPoint tp.EndPoint) {
+	name := endPoint.NamespaceName + "_" + endPoint.EndPointName
+
+	if action == "DELETED" {
+		delete(fd.SecurityPolicies, name)
+	}
+
+	// ADDED | MODIFIED
+	matches := tp.MatchPolicies{}
+
+	for _, secPolicy := range endPoint.SecurityPolicies {
+		policyName := secPolicy.Metadata["policyName"]
+
+		if len(secPolicy.Spec.AppArmor) > 0 {
+			continue
+		}
+
+		for _, path := range secPolicy.Spec.Process.MatchPaths {
+			fromSource := ""
+
+			if len(path.FromSource) == 0 {
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, path)
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range path.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, path)
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, dir := range secPolicy.Spec.Process.MatchDirectories {
+			fromSource := ""
+
+			if len(dir.FromSource) == 0 {
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, dir)
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range dir.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, dir)
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, patt := range secPolicy.Spec.Process.MatchPatterns {
+			if len(patt.Pattern) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, patt)
+
+			regexpComp, err := regexp.Compile(patt.Pattern)
+			if err != nil {
+				fd.Debugf("MatchPolicy Regexp compilation error: %s\n", patt.Pattern)
+				continue
+			}
+			match.Regexp = regexpComp
+			// Using 'Glob' despite compiling 'Regexp', since we don't have
+			// a native pattern matching design yet and 'Glob' is more similar
+			// to AppArmor's pattern matching syntax.
+			match.ResourceType = "Glob"
+
+			matches.Policies = append(matches.Policies, match)
+		}
+
+		for _, path := range secPolicy.Spec.File.MatchPaths {
+			fromSource := ""
+
+			if len(path.FromSource) == 0 {
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, path)
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range path.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, path)
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, dir := range secPolicy.Spec.File.MatchDirectories {
+			fromSource := ""
+
+			if len(dir.FromSource) == 0 {
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, dir)
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range dir.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, dir)
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, patt := range secPolicy.Spec.File.MatchPatterns {
+			if len(patt.Pattern) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, patt)
+
+			regexpComp, err := regexp.Compile(patt.Pattern)
+			if err != nil {
+				fd.Debugf("MatchPolicy Regexp compilation error: %s\n", patt.Pattern)
+				continue
+			}
+			match.Regexp = regexpComp
+			// Using 'Glob' despite compiling 'Regexp', since we don't have
+			// a native pattern matching design yet and 'Glob' is more similar
+			// to AppArmor's pattern matching syntax.
+			match.ResourceType = "Glob"
+
+			matches.Policies = append(matches.Policies, match)
+		}
+
+		for _, proto := range secPolicy.Spec.Network.MatchProtocols {
+			if len(proto.Protocol) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			if len(proto.FromSource) == 0 {
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, proto)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range proto.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, proto)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+
+		}
+
+		for _, dns := range secPolicy.Spec.Network.MatchDNSQueries {
+			if len(dns.Domain) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			if len(dns.FromSource) == 0 {
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, dns)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range dns.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, dns)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, cap := range secPolicy.Spec.Capabilities.MatchCapabilities {
+			if len(cap.Capability) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			if len(cap.FromSource) == 0 {
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, cap)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range cap.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, cap)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		// MatchSyscalls
+		for _, syscallRule := range secPolicy.Spec.Syscalls.MatchSyscalls {
+			if len(syscallRule.Syscalls) == 0 {
+				continue
+			}
+			fromSource := ""
+			syscall := tp.SyscallMatchType{
+				Tags:     syscallRule.Tags,
+				Message:  syscallRule.Message,
+				Severity: syscallRule.Severity,
+			}
+			if len(syscallRule.FromSource) == 0 {
+				for _, syscallName := range syscallRule.Syscalls {
+					syscall.Syscalls = []string{syscallName}
+					match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, syscall)
+					if len(match.ResourceType) == 0 {
+						continue
+					}
+					matches.Policies = append(matches.Policies, match)
+				}
+				continue
+			}
+
+			for _, src := range syscallRule.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else if len(src.Dir) > 0 {
+					fromSource = src.Dir
+					if !strings.HasSuffix(fromSource, "/") {
+						fromSource += "/"
+					}
+				} else {
+					continue
+				}
+				for _, syscallName := range syscallRule.Syscalls {
+					syscall.Syscalls = []string{syscallName}
+					match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, syscall)
+					if len(match.ResourceType) == 0 {
+						continue
+					}
+					match.IsFromSource = len(fromSource) > 0
+					match.Recursive = len(src.Path) == 0 && src.Recursive
+					matches.Policies = append(matches.Policies, match)
+				}
+
+			}
+		}
+		// SyscallsMatchPath
+		for _, syscallRule := range secPolicy.Spec.Syscalls.MatchPaths {
+			if len(syscallRule.Path) == 0 || len(syscallRule.Syscalls) == 0 {
+				continue
+			}
+			fromSource := ""
+			syscall := tp.SyscallMatchPathType{
+				Tags:     syscallRule.Tags,
+				Message:  syscallRule.Message,
+				Severity: syscallRule.Severity,
+				Path:     syscallRule.Path,
+			}
+			if len(syscallRule.FromSource) == 0 {
+				for _, syscallName := range syscallRule.Syscalls {
+					syscall.Syscalls = []string{syscallName}
+					match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, syscall)
+					if len(match.ResourceType) == 0 && len(match.Resource) == 0 {
+						continue
+					}
+					match.ReadOnly = syscallRule.Recursive
+					matches.Policies = append(matches.Policies, match)
+				}
+				continue
+			}
+
+			for _, src := range syscallRule.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else if len(src.Dir) > 0 {
+					fromSource = src.Dir
+					if !strings.HasSuffix(fromSource, "/") {
+						fromSource += "/"
+					}
+				} else {
+					continue
+				}
+				for _, syscallName := range syscallRule.Syscalls {
+					syscall.Syscalls = []string{syscallName}
+					match := fd.newMatchPolicy(endPoint.PolicyEnabled, policyName, fromSource, syscall)
+					if len(match.ResourceType) == 0 && len(match.Resource) == 0 {
+						continue
+					}
+					match.IsFromSource = len(fromSource) > 0
+					match.Recursive = len(src.Path) == 0 && src.Recursive
+					match.ReadOnly = syscallRule.Recursive
+					matches.Policies = append(matches.Policies, match)
+				}
+			}
+
+		}
+	}
+
+	fd.SecurityPoliciesLock.Lock()
+	fd.SecurityPolicies[name] = matches
+	fd.SecurityPoliciesLock.Unlock()
+}
+
+// ============================ //
+// == Host Security Policies == //
+// ============================ //
+
+// UpdateHostSecurityPolicies Function
+func (fd *Feeder) UpdateHostSecurityPolicies(action string, secPolicies []tp.HostSecurityPolicy) {
+	if action == "DELETED" {
+		delete(fd.SecurityPolicies, fd.Node.NodeName)
+		return
+	}
+
+	// ADDED | MODIFIED
+	matches := tp.MatchPolicies{}
+
+	for _, secPolicy := range secPolicies {
+		policyName := secPolicy.Metadata["policyName"]
+
+		if len(secPolicy.Spec.AppArmor) > 0 {
+			continue
+		}
+
+		for _, path := range secPolicy.Spec.Process.MatchPaths {
+			fromSource := ""
+
+			if len(path.FromSource) == 0 {
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, path)
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range path.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, path)
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, dir := range secPolicy.Spec.Process.MatchDirectories {
+			fromSource := ""
+
+			if len(dir.FromSource) == 0 {
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, dir)
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range dir.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, dir)
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, patt := range secPolicy.Spec.Process.MatchPatterns {
+			if len(patt.Pattern) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			match := fd.newMatchPolicy(tp.KubeArmorPolicyEnabled, policyName, fromSource, patt)
+
+			regexpComp, err := regexp.Compile(patt.Pattern)
+			if err != nil {
+				fd.Debugf("MatchPolicy Regexp compilation error: %s\n", patt.Pattern)
+				continue
+			}
+			match.Regexp = regexpComp
+			// Using 'Glob' despite compiling 'Regexp', since we don't have
+			// a native pattern matching design yet and 'Glob' is more similar
+			// to AppArmor's pattern matching syntax.
+			match.ResourceType = "Glob"
+
+			matches.Policies = append(matches.Policies, match)
+		}
+
+		for _, path := range secPolicy.Spec.File.MatchPaths {
+			fromSource := ""
+
+			if len(path.FromSource) == 0 {
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, path)
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range path.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, path)
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, dir := range secPolicy.Spec.File.MatchDirectories {
+			fromSource := ""
+
+			if len(dir.FromSource) == 0 {
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, dir)
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range dir.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, dir)
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, patt := range secPolicy.Spec.File.MatchPatterns {
+			if len(patt.Pattern) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, patt)
+
+			regexpComp, err := regexp.Compile(patt.Pattern)
+			if err != nil {
+				fd.Debugf("MatchPolicy Regexp compilation error: %s\n", patt.Pattern)
+				continue
+			}
+			match.Regexp = regexpComp
+			// Using 'Glob' despite compiling 'Regexp', since we don't have
+			// a native pattern matching design yet and 'Glob' is more similar
+			// to AppArmor's pattern matching syntax.
+			match.ResourceType = "Glob"
+
+			matches.Policies = append(matches.Policies, match)
+		}
+
+		for _, proto := range secPolicy.Spec.Network.MatchProtocols {
+			if len(proto.Protocol) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			if len(proto.FromSource) == 0 {
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, proto)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range proto.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, proto)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, dns := range secPolicy.Spec.Network.MatchDNSQueries {
+			if len(dns.Domain) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			if len(dns.FromSource) == 0 {
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, dns)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range dns.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, dns)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		for _, device := range secPolicy.Spec.Device.MatchDevice {
+			if len(device.Class) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, device)
+			if len(match.Resource) == 0 {
+				continue
+			}
+
+			matches.Policies = append(matches.Policies, match)
+		}
+
+		for _, cap := range secPolicy.Spec.Capabilities.MatchCapabilities {
+			if len(cap.Capability) == 0 {
+				continue
+			}
+
+			fromSource := ""
+
+			if len(cap.FromSource) == 0 {
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, cap)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				matches.Policies = append(matches.Policies, match)
+				continue
+			}
+
+			for _, src := range cap.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else {
+					continue
+				}
+
+				match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, cap)
+				if len(match.Resource) == 0 {
+					continue
+				}
+				match.IsFromSource = len(fromSource) > 0
+				matches.Policies = append(matches.Policies, match)
+			}
+		}
+
+		// MatchSyscalls
+		for _, syscallRule := range secPolicy.Spec.Syscalls.MatchSyscalls {
+			if len(syscallRule.Syscalls) == 0 {
+				continue
+			}
+			fromSource := ""
+			syscall := tp.SyscallMatchType{
+				Tags:     syscallRule.Tags,
+				Message:  syscallRule.Message,
+				Severity: syscallRule.Severity,
+			}
+			if len(syscallRule.FromSource) == 0 {
+				for _, syscallName := range syscallRule.Syscalls {
+					syscall.Syscalls = []string{syscallName}
+					match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, syscall)
+					if len(match.ResourceType) == 0 {
+						continue
+					}
+					matches.Policies = append(matches.Policies, match)
+				}
+				continue
+			}
+
+			for _, src := range syscallRule.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else if len(src.Dir) > 0 {
+					fromSource = src.Dir
+					if !strings.HasSuffix(fromSource, "/") {
+						fromSource += "/"
+					}
+				} else {
+					continue
+				}
+				for _, syscallName := range syscallRule.Syscalls {
+					syscall.Syscalls = []string{syscallName}
+					match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, syscall)
+					if len(match.ResourceType) == 0 {
+						continue
+					}
+					match.IsFromSource = len(fromSource) > 0
+					match.Recursive = len(src.Path) == 0 && src.Recursive
+					matches.Policies = append(matches.Policies, match)
+				}
+
+			}
+		}
+		// SyscallsMatchPath
+		for _, syscallRule := range secPolicy.Spec.Syscalls.MatchPaths {
+			if len(syscallRule.Path) == 0 || len(syscallRule.Syscalls) == 0 {
+				continue
+			}
+			fromSource := ""
+			syscall := tp.SyscallMatchPathType{
+				Tags:     syscallRule.Tags,
+				Message:  syscallRule.Message,
+				Severity: syscallRule.Severity,
+			}
+			if len(syscallRule.FromSource) == 0 {
+				for _, syscallName := range syscallRule.Syscalls {
+					syscall.Syscalls = []string{syscallName}
+					match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, syscall)
+					if len(match.ResourceType) == 0 && len(match.Resource) == 0 {
+						continue
+					}
+					matches.Policies = append(matches.Policies, match)
+					match.Source = syscallRule.Path
+				}
+				continue
+			}
+
+			for _, src := range syscallRule.FromSource {
+				if len(src.Path) > 0 {
+					fromSource = src.Path
+				} else if len(src.Dir) > 0 {
+					fromSource = src.Dir
+					if !strings.HasSuffix(fromSource, "/") {
+						fromSource += "/"
+					}
+				} else {
+					continue
+				}
+				for _, syscallName := range syscallRule.Syscalls {
+					syscall.Syscalls = []string{syscallName}
+					match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, fromSource, syscall)
+					if len(match.ResourceType) == 0 && len(match.Resource) == 0 {
+						continue
+					}
+					match.IsFromSource = len(fromSource) > 0
+					match.Recursive = len(src.Path) == 0 && src.Recursive
+					matches.Policies = append(matches.Policies, match)
+				}
+			}
+
+		}
+	}
+
+	fd.SecurityPoliciesLock.Lock()
+	fd.SecurityPolicies[fd.Node.NodeName] = matches
+	fd.SecurityPoliciesLock.Unlock()
+}
+
+// =============================== //
+// == Network Security Policies == //
+// =============================== //
+
+// UpdateNetworkSecurityPolicies Function
+func (fd *Feeder) UpdateNetworkSecurityPolicies(action string, secPolicies []tp.NetworkSecurityPolicy) {
+	if action == "DELETED" {
+		delete(fd.SecurityPolicies, fd.Node.NodeName)
+		return
+	}
+
+	// ADDED | MODIFIED
+	matches := tp.MatchPolicies{}
+
+	for _, secPolicy := range secPolicies {
+		policyName := secPolicy.Metadata["policyName"]
+
+		// ingress
+		for _, in := range secPolicy.Spec.Ingress {
+			match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, "", in)
+			matches.Policies = append(matches.Policies, match)
+		}
+
+		// egress
+		for _, eg := range secPolicy.Spec.Egress {
+			match := fd.newMatchPolicy(fd.Node.PolicyEnabled, policyName, "", eg)
+			matches.Policies = append(matches.Policies, match)
+		}
+	}
+
+	fd.SecurityPoliciesLock.Lock()
+	fd.SecurityPolicies[fd.Node.NodeName] = matches
+	fd.SecurityPoliciesLock.Unlock()
+
+}
+
+// ===================== //
+// == Default Posture == //
+// ===================== //
+
+// UpdateDefaultPosture Function
+func (fd *Feeder) UpdateDefaultPosture(action string, namespace string, defaultPosture tp.DefaultPosture) {
+
+	fd.DefaultPosturesLock.Lock()
+	defer fd.DefaultPosturesLock.Unlock()
+
+	if action == "DELETED" {
+		delete(fd.DefaultPostures, namespace)
+	} else { // ADDED or MODIFIED
+		fd.DefaultPostures[namespace] = defaultPosture
+	}
+}
+
+// MatchResources function
+func matchResources(secPolicy tp.MatchPolicy, log tp.Log) bool {
+	// match process and file resources
+
+	firstLogResource := strings.Split(log.Resource, " ")[0]
+	firstLogResourceDir := getDirectoryPart(firstLogResource)
+	firstLogResourceDirCount := strings.Count(firstLogResourceDir, "/")
+	procDirCount := strings.Count(getDirectoryPart(log.ProcessName), "/")
+
+	if secPolicy.Operation == "File" {
+		if secPolicy.ResourceType == "Path" && secPolicy.Resource == firstLogResource {
+			return true
+		}
+
+		// check if the log's resource directory starts with the policy's resource directory
+		if secPolicy.ResourceType == "Directory" && (strings.HasPrefix(firstLogResourceDir, secPolicy.Resource) &&
+			// for non-recursive rule - check if the directory depth of the log matches the policy resource's depth
+			((!secPolicy.Recursive && firstLogResourceDirCount == strings.Count(secPolicy.Resource, "/")) ||
+				// for recursive rule - check the log's directory is at the same or deeper level than the policy's resource
+				(secPolicy.Recursive && firstLogResourceDirCount >= strings.Count(secPolicy.Resource, "/")))) ||
+			// exact matching - check if the policy's resource is exactly the logged resource with a trailing slash
+			(secPolicy.Resource == (log.Resource + "/")) ||
+			// match if the policy is recursive and applies to the root directory
+			(secPolicy.Resource == "/" && secPolicy.Recursive) {
+			return true
+		}
+	}
+
+	if secPolicy.Operation == "Process" {
+		if secPolicy.ResourceType == "Path" && secPolicy.Resource == log.ProcessName {
+			return true
+		}
+		if secPolicy.ResourceType == "Directory" && strings.HasPrefix(getDirectoryPart(log.ProcessName), secPolicy.Resource) &&
+			((!secPolicy.Recursive && procDirCount == strings.Count(secPolicy.Resource, "/")) ||
+				(secPolicy.Recursive && procDirCount >= strings.Count(secPolicy.Resource, "/"))) {
+			return true
+		}
+	}
+	return false
+
+}
+
+// matchDeviceResource Function
+func matchDeviceResource(logResource, spResource string) bool {
+	parseLevel := func(s string) uint8 {
+		l, err := strconv.ParseUint(s, 10, 8)
+		if err != nil {
+			return 0
+		}
+		return uint8(l)
+	}
+
+	logParts := strings.Fields(logResource) // ["USB", "HID_2_1", "2"]
+	spParts := strings.Fields(spResource)   // ["USB", "HID_*_*"] or ["USB", "HID_2_*", "2"]
+
+	logMain := strings.Split(logParts[1], "_") // ["HID","2","1"]
+	logClass := logMain[0]
+	logSubClass := logMain[1]
+	logProtocol := logMain[2]
+
+	logLevel := uint8(0)
+	if len(logParts) > 2 {
+		logLevel = parseLevel(logParts[2])
+	}
+
+	policyMain := strings.Split(spParts[1], "_") // ["HID","2","*"] or ["ALL","*","*"]
+	policyClass := policyMain[0]
+	policySubClass := policyMain[1]
+	policyProtocol := policyMain[2]
+
+	policyLevel := uint8(0)
+	if len(spParts) > 2 {
+		policyLevel = parseLevel(spParts[2])
+	}
+
+	// class
+	if policyClass != "ALL" && policyClass != logClass {
+		return false
+	}
+
+	// subClass
+	if policySubClass != "*" && policySubClass != logSubClass {
+		return false
+	}
+
+	// protocol
+	if policyProtocol != "*" && policyProtocol != logProtocol {
+		return false
+	}
+
+	// level
+	if policyLevel != 0 && policyLevel != logLevel {
+		return false
+	}
+
+	return true
+}
+
+func getDevicePolicySpecificity(secPolicy tp.MatchPolicy) int {
+	sp := 0
+
+	if secPolicy.Operation == "Device" {
+		parts := strings.Split(secPolicy.Resource, " ") // ["USB", "MASS-STORAGE_6_80"] or ["USB", "ALL_*_*", "3"]
+
+		codes := strings.Split(parts[1], "_") // ["HID","2","*"] or ["ALL","*","*"]
+
+		sp += 100 // class is always present
+
+		subClass := codes[1]
+		if subClass != "*" {
+			sp += 10
+		}
+
+		protocol := codes[2]
+		if protocol != "*" {
+			sp += 1
+		}
+
+		if len(parts) > 2 { // level present
+			sp += 100
+		}
+	}
+
+	return sp
+}
+
+// Update Log Fields based on default posture and visibility configuration and return false if no updates
+func setLogFields(log *tp.Log, existAllowPolicy bool, defaultPosture string, visibility, containerEvent, networkfwEvent bool) bool {
+	if existAllowPolicy && defaultPosture == "audit" && (*log).Result == "Passed" {
+
+		(*log).PolicyName = "DefaultPosture"
+		(*log).Enforcer = "eBPF Monitor"
+		(*log).Action = "Audit"
+
+		if containerEvent {
+			(*log).Type = "MatchedPolicy"
+		} else if networkfwEvent {
+			(*log).Type = "MatchedNetworkPolicy"
+			(*log).Enforcer = "NetworkPolicyEnforcer"
+		} else {
+			(*log).Type = "MatchedHostPolicy"
+		}
+
+		return true
+	}
+	if existAllowPolicy && defaultPosture == "block" && (*log).Result != "Passed" {
+
+		(*log).PolicyName = "DefaultPosture"
+		(*log).Enforcer = "eBPF Monitor"
+		(*log).Action = "Block"
+
+		if containerEvent {
+			(*log).Type = "MatchedPolicy"
+		} else if networkfwEvent {
+			(*log).Type = "MatchedNetworkPolicy"
+			(*log).Enforcer = "NetworkPolicyEnforcer"
+		} else {
+			(*log).Type = "MatchedHostPolicy"
+		}
+
+		return true
+	}
+
+	if containerEvent {
+		// return here as container events are dropped in kernel space
+		(*log).Type = "ContainerLog"
+		return true
+	} else {
+		// host events are dropped in userspace
+		(*log).Type = "HostLog"
+	}
+
+	// handles host visibility
+	// return true if visibility enabled
+	// return false otherwise so that log is skipped
+	return visibility
+}
+
+// ==================== //
+// == Policy Matches == //
+// ==================== //
+
+func getDirectoryPart(path string) string {
+	dir := filepath.Dir(path)
+	if strings.HasPrefix(dir, "/") {
+		return dir + "/"
+	}
+	return "__not_absolute_path__"
+}
+
+// UpdateMatchedPolicy Function
+func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
+	existFileAllowPolicy := false
+	existNetworkAllowPolicy := false
+	existCapabilitiesAllowPolicy := false
+	existUSBDeviceAllowPolicy := false
+	existNetworkFirewallAllowPolicy := false
+	fd.DefaultPosturesLock.Lock()
+	defer fd.DefaultPosturesLock.Unlock()
+	if log.Result == "Passed" || log.Result == "Operation not permitted" || log.Result == "Permission denied" {
+		if log.Type == "SystemEvent" {
+			return log
+		}
+		fd.SecurityPoliciesLock.RLock()
+
+		key := cfg.GlobalCfg.Host
+
+		if log.NamespaceName != "" && log.PodName != "" {
+			key = log.NamespaceName + "_" + log.PodName
+		}
+
+		secPolicies := fd.SecurityPolicies[key].Policies
+		// for "Network" case below we use skip bool to skip the log when the log is matched with one of the allowed rules in secPolicies
+		// skip is set to true(in below cases, in Network) for the log event which is matched by the rules
+		skip := false
+
+		// for "Device" case below we use specificity to match the log with the most specifically defined policy
+		specificity := 0
+
+		for rule, secPolicy := range secPolicies {
+			if secPolicy.Action == "Allow" || secPolicy.Action == "Audit (Allow)" {
+				if secPolicy.Operation == "Process" || secPolicy.Operation == "File" {
+					existFileAllowPolicy = true
+				} else if secPolicy.Operation == "Network" {
+					existNetworkAllowPolicy = true
+				} else if secPolicy.Operation == "Capabilities" {
+					existCapabilitiesAllowPolicy = true
+				} else if secPolicy.Operation == "Device" {
+					existUSBDeviceAllowPolicy = true
+				} else if secPolicy.Operation == "NetworkFirewall" {
+					existNetworkFirewallAllowPolicy = true
+				}
+
+				if fd.DefaultPostures[log.NamespaceName].FileAction == "allow" {
+					continue
+				}
+			}
+			switch log.Operation {
+			case "Process", "File":
+				if secPolicy.Operation != log.Operation {
+					continue
+				}
+
+				// when one of the below rule is already matched for the log event, we will skip for further matches
+				if skip {
+					break // break, so that once source is matched for a log it doesn't look for other cases
+				}
+
+				// match sources
+				if (!secPolicy.IsFromSource) || (secPolicy.IsFromSource && (secPolicy.Source == log.ParentProcessName || secPolicy.Source == log.ProcessName)) {
+					matchedRegex := false
+
+					switch secPolicy.ResourceType {
+					case "Glob":
+						// Match using a globbing syntax very similar to the AppArmor's
+						fileMatch, _ := filepath.Match(secPolicy.Resource, log.Resource)
+						procMatch, _ := filepath.Match(secPolicy.Resource, log.ProcessName) // pattern (secPolicy.Resource) -> string (log.Resource)
+						matchedRegex = fileMatch || procMatch
+					case "Regexp":
+						if secPolicy.Regexp != nil {
+							// Match using compiled regular expression
+							fileMatch := secPolicy.Regexp.MatchString(log.Resource)    // regexp (secPolicy.Regexp) -> string (log.Resource)
+							procMatch := secPolicy.Regexp.MatchString(log.ProcessName) // pattern (secPolicy.Resource) -> string (log.Resource)
+							matchedRegex = fileMatch || procMatch
+						}
+					case "ExecName":
+						matchedRegex = strings.HasSuffix(log.ProcessName, "/"+secPolicy.Resource) // processpath = */execname
+					}
+
+					// match resources
+					if matchedRegex || matchResources(secPolicy, log) {
+
+						matchedFlags := false
+
+						if secPolicy.ReadOnly && log.Resource != "" && secPolicy.OwnerOnly {
+							// read only && owner only
+							if strings.Contains(log.Data, "O_RDONLY") && log.UID == log.OID && strings.Contains(secPolicy.Action, "Allow") {
+								matchedFlags = true
+							} else if (strings.Contains(log.Data, "O_RDONLY") && log.UID != log.OID) || (!strings.Contains(log.Data, "O_RDONLY") && log.UID == log.OID) || (!strings.Contains(log.Data, "O_RDONLY") && log.UID != log.OID) {
+								matchedFlags = true
+							}
+						} else if secPolicy.ReadOnly && log.Resource != "" {
+							// read only
+							if strings.Contains(log.Data, "O_RDONLY") && strings.Contains(secPolicy.Action, "Allow") {
+								matchedFlags = true
+							} else if !strings.Contains(log.Data, "O_RDONLY") {
+								matchedFlags = true
+							}
+						} else if secPolicy.OwnerOnly {
+							// owner only
+							if log.UID == log.OID && strings.Contains(secPolicy.Action, "Allow") {
+								matchedFlags = true
+							} else if log.UID != log.OID {
+								matchedFlags = true
+							}
+						} else if secPolicy.Pts != nil && !*secPolicy.Pts {
+							if log.TTY == "" {
+								matchedFlags = false
+							} else {
+								matchedFlags = true
+							}
+						} else {
+							// ! read only && ! owner only
+							matchedFlags = true
+						}
+
+						if matchedFlags && (secPolicy.Action == "Allow" || secPolicy.Action == "Audit (Allow)") && log.Result == "Passed" {
+							// allow policy or allow policy with audit mode
+							// matched source + matched resource + matched flags + matched action + expected result -> going to be skipped
+							if log.Action == "Audit" {
+								// could be a case of lenient whitelist policy
+								continue
+							}
+							log.Type = "MatchedPolicy"
+
+							log.PolicyName = secPolicy.PolicyName
+							log.Severity = secPolicy.Severity
+
+							if len(secPolicy.Tags) > 0 {
+								log.Tags = strings.Join(secPolicy.Tags[:], ",")
+								log.ATags = secPolicy.Tags
+							}
+
+							if len(secPolicy.Message) > 0 {
+								log.Message = secPolicy.Message
+							}
+
+							if log.PolicyEnabled == tp.KubeArmorPolicyAudited {
+								log.Enforcer = "eBPF Monitor"
+							} else {
+								log.Enforcer = fd.GetEnforcer()
+							}
+
+							log.Action = "Allow"
+
+							continue
+						}
+
+						if matchedFlags && secPolicy.Action == "Audit" && log.Result == "Passed" {
+							// audit policy
+							// matched source + matched resource + matched flags + matched action + expected result -> alert (audit log)
+
+							log.Type = "MatchedPolicy"
+
+							log.PolicyName = secPolicy.PolicyName
+							log.Severity = secPolicy.Severity
+
+							if len(secPolicy.Tags) > 0 {
+								log.Tags = strings.Join(secPolicy.Tags[:], ",")
+								log.ATags = secPolicy.Tags
+							}
+
+							if len(secPolicy.Message) > 0 {
+								log.Message = secPolicy.Message
+							}
+
+							log.Enforcer = "eBPF Monitor"
+							log.Action = secPolicy.Action
+
+							skip = true
+							continue
+						}
+
+						if (secPolicy.Action == "Block" && log.Result != "Passed") ||
+							(matchedFlags && (!secPolicy.OwnerOnly && !secPolicy.ReadOnly) && secPolicy.Action == "Audit (Block)" && log.Result == "Passed") ||
+							(!matchedFlags && (secPolicy.OwnerOnly || secPolicy.ReadOnly) && secPolicy.Action == "Audit (Block)" && log.Result == "Passed") {
+							// block policy or block policy with audit mode
+							// matched source + matched resource + matched action + expected result -> alert
+
+							log.Type = "MatchedPolicy"
+
+							log.PolicyName = secPolicy.PolicyName
+							log.Severity = secPolicy.Severity
+
+							if len(secPolicy.Tags) > 0 {
+								log.Tags = strings.Join(secPolicy.Tags[:], ",")
+								log.ATags = secPolicy.Tags
+							}
+
+							if len(secPolicy.Message) > 0 {
+								log.Message = secPolicy.Message
+							}
+
+							if log.PolicyEnabled == tp.KubeArmorPolicyAudited {
+								log.Enforcer = "eBPF Monitor"
+							} else {
+								log.Enforcer = fd.GetEnforcer()
+							}
+
+							log.Action = secPolicy.Action
+
+							skip = true
+							continue
+						}
+
+						if matchedFlags && secPolicy.Action == "Allow" && log.Result != "Passed" {
+							// It's possible there are additional rules in the Security Policy resulting in the block else we deem it as default posture anyway
+							continue
+						}
+					}
+
+					if secPolicy.Action == "Allow" && log.Result != "Passed" {
+						// matched source + !(matched resource) + action = allow + result = blocked -> default posture / allow policy violation
+
+						log.Type = "MatchedPolicy"
+
+						log.PolicyName = "DefaultPosture"
+
+						log.Severity = ""
+						log.Tags = ""
+						log.ATags = []string{}
+						log.Message = ""
+
+						log.Enforcer = "eBPF Monitor"
+						log.Action = "Block"
+
+						continue
+					}
+
+					if secPolicy.Action == "Audit (Allow)" && log.Result == "Passed" {
+						// matched source + !(matched resource) + action = audit (allow) + result = passed -> default posture / allow policy violation (audit mode)
+
+						log.Type = "MatchedPolicy"
+
+						log.PolicyName = "DefaultPosture"
+
+						log.Severity = ""
+						log.Tags = ""
+						log.ATags = []string{}
+						log.Message = ""
+
+						log.Enforcer = "eBPF Monitor"
+
+						if fd.DefaultPostures[log.NamespaceName].FileAction == "block" {
+							log.Action = "Audit (Block)"
+						} else { // fd.DefaultPostures[log.NamespaceName].FileAction == "audit"
+							log.Action = "Audit"
+						}
+
+						continue
+					}
+				}
+
+				// apply the default postures when log.type isn't yet known
+
+				if fd.DefaultPostures[log.NamespaceName].FileAction == "block" && secPolicy.Action == "Audit (Allow)" && log.Result == "Passed" && log.Type == "" {
+					// defaultPosture = block + audit mode
+					log.Type = "MatchedPolicy"
+
+					log.PolicyName = "DefaultPosture"
+
+					log.Severity = ""
+					log.Tags = ""
+					log.ATags = []string{}
+					log.Message = ""
+
+					log.Enforcer = "eBPF Monitor"
+					log.Action = "Audit (Block)"
+				}
+
+				if fd.DefaultPostures[log.NamespaceName].FileAction == "audit" && (secPolicy.Action == "Allow" || secPolicy.Action == "Audit (Allow)") && log.Result == "Passed" && log.Type == "" {
+					// defaultPosture = audit
+					log.Type = "MatchedPolicy"
+
+					log.PolicyName = "DefaultPosture"
+
+					log.Severity = ""
+					log.Tags = ""
+					log.ATags = []string{}
+					log.Message = ""
+
+					log.Enforcer = "eBPF Monitor"
+					log.Action = "Audit"
+				}
+
+			case "Network":
+				if secPolicy.Operation != log.Operation {
+					continue
+				}
+
+				// when one of the below rule is already matched for the log event, we will skip for further matches
+				if skip {
+					break // break, so that once source is matched for a log it doesn't look for other cases
+				}
+
+				// match sources
+				if (!secPolicy.IsFromSource) || (secPolicy.IsFromSource && (strings.HasPrefix(log.Source, secPolicy.Source+" ") || secPolicy.Source == log.ProcessName)) {
+					matchedFlags := false
+
+					protocol := "unknown"
+					switch secPolicy.ResourceType {
+					case "Protocol":
+						protocol = fetchProtocol(log.Resource)
+						if protocol == secPolicy.Resource || secPolicy.Resource == "all" {
+							matchedFlags = true
+						}
+						if secPolicy.Pts != nil && !*secPolicy.Pts {
+							if log.TTY == "" {
+								matchedFlags = false
+							} else {
+								matchedFlags = true
+							}
+						}
+					case "DNS":
+						// For BPFLSM events, log.Resource is the domain.
+						// For kprobe (udp_sendmsg) audit events, the domain is embedded in log.Data (e.g., "domain=google.com").
+						resource := strings.ToLower(log.Resource)
+						if strings.Contains(log.Data, "domain=") {
+							for _, part := range strings.Split(log.Data, " ") {
+								if strings.HasPrefix(part, "domain=") {
+									resource = strings.ToLower(strings.TrimPrefix(part, "domain="))
+									break
+								}
+							}
+						}
+
+						// Match exact domain or K8s search-path expansions (e.g. google.com.svc.cluster.local)
+						domain := strings.ToLower(secPolicy.Resource)
+						resourceSlice := strings.Split(resource, ".")
+						for len(resourceSlice) != 0 {
+							resource = strings.Join(resourceSlice, ".")
+							if resource == domain || strings.HasPrefix(resource, domain+".") {
+								log.Resource = secPolicy.Resource // normalize log resource to the policy resource
+								matchedFlags = true
+							}
+							resourceSlice = resourceSlice[1:]
+						}
+					}
+
+					if matchedFlags {
+						if (secPolicy.Action == "Allow" || secPolicy.Action == "Audit (Allow)") && log.Result == "Passed" {
+							// allow policy or allow policy with audit mode
+							// matched source + matched resource + matched action + expected result -> going to be skipped
+
+							log.Type = "MatchedPolicy"
+
+							log.PolicyName = secPolicy.PolicyName
+							log.Severity = secPolicy.Severity
+
+							if len(secPolicy.Tags) > 0 {
+								log.Tags = strings.Join(secPolicy.Tags[:], ",")
+								log.ATags = secPolicy.Tags
+							}
+
+							if len(secPolicy.Message) > 0 {
+								log.Message = secPolicy.Message
+							}
+
+							if log.PolicyEnabled == tp.KubeArmorPolicyAudited {
+								log.Enforcer = "eBPF Monitor"
+							} else {
+								log.Enforcer = fd.GetEnforcer()
+							}
+
+							log.Action = "Allow"
+
+							skip = true
+							continue
+						}
+
+						if secPolicy.Action == "Audit" && log.Result == "Passed" {
+							// audit policy
+							// matched source + matched resource + matched action + expected result -> alert (audit log)
+
+							log.Type = "MatchedPolicy"
+
+							log.PolicyName = secPolicy.PolicyName
+							log.Severity = secPolicy.Severity
+
+							if len(secPolicy.Tags) > 0 {
+								log.Tags = strings.Join(secPolicy.Tags[:], ",")
+								log.ATags = secPolicy.Tags
+							}
+
+							if len(secPolicy.Message) > 0 {
+								log.Message = secPolicy.Message
+							}
+
+							log.Enforcer = "eBPF Monitor"
+							log.Action = secPolicy.Action
+
+							skip = true
+							continue
+						}
+
+						if (secPolicy.Action == "Block" && log.Result != "Passed") ||
+							(secPolicy.Action == "Audit (Block)" && log.Result == "Passed") {
+							// block policy or block policy with audit mode
+							// matched source + matched resource + matched action + expected result -> alert
+
+							log.Type = "MatchedPolicy"
+
+							log.PolicyName = secPolicy.PolicyName
+							log.Severity = secPolicy.Severity
+
+							if len(secPolicy.Tags) > 0 {
+								log.Tags = strings.Join(secPolicy.Tags[:], ",")
+							}
+
+							if len(secPolicy.Message) > 0 {
+								log.Message = secPolicy.Message
+							}
+
+							if log.PolicyEnabled == tp.KubeArmorPolicyAudited {
+								log.Enforcer = "eBPF Monitor"
+							} else {
+								log.Enforcer = fd.GetEnforcer()
+							}
+
+							log.Action = secPolicy.Action
+
+							skip = true
+							continue
+						}
+					}
+					// if protocol is unknown we skip the audit alert event
+					if protocol == "unknown" && secPolicy.ResourceType == "Protocol" {
+						log.Type = "MatchedPolicy"
+						log.Action = "Allow"
+						continue
+					}
+
+					// keep looking for a rule to be matched
+					// send audit alert only when all the rules are compared and none is matched
+					if !matchedFlags && rule < len(secPolicies)-1 {
+						continue
+					}
+
+					if secPolicy.Action == "Allow" && log.Result != "Passed" {
+						// matched source + !(matched resource) + action = allow + result = blocked -> allow policy violation
+
+						log.Type = "MatchedPolicy"
+
+						log.PolicyName = "DefaultPosture"
+
+						log.Severity = ""
+						log.Tags = ""
+						log.Message = ""
+
+						log.Enforcer = "eBPF Monitor"
+						log.Action = "Block"
+
+						continue
+					}
+
+					if secPolicy.Action == "Audit (Allow)" && log.Result == "Passed" {
+						// matched source + !(matched resource) + action = audit (allow) + result = passed -> allow policy violation (audit mode)
+
+						log.Type = "MatchedPolicy"
+
+						log.PolicyName = "DefaultPosture"
+
+						log.Severity = ""
+						log.Tags = ""
+						log.Message = ""
+
+						log.Enforcer = "eBPF Monitor"
+
+						if fd.DefaultPostures[log.NamespaceName].NetworkAction == "block" {
+							log.Action = "Audit (Block)"
+						} else { // fd.DefaultPostures[log.NamespaceName].NetworkAction == "audit"
+							log.Action = "Audit"
+						}
+
+						continue
+					}
+				}
+
+				if fd.DefaultPostures[log.NamespaceName].NetworkAction == "block" && secPolicy.Action == "Audit (Allow)" && log.Result == "Passed" {
+					// defaultPosture = block + audit mode
+
+					log.Type = "MatchedPolicy"
+
+					log.PolicyName = "DefaultPosture"
+
+					log.Severity = ""
+					log.Tags = ""
+					log.Message = ""
+
+					log.Enforcer = "eBPF Monitor"
+					log.Action = "Audit (Block)"
+				}
+
+				if fd.DefaultPostures[log.NamespaceName].NetworkAction == "audit" && (secPolicy.Action == "Allow" || secPolicy.Action == "Audit (Allow)") && log.Result == "Passed" {
+					// defaultPosture = audit
+
+					log.Type = "MatchedPolicy"
+
+					log.PolicyName = "DefaultPosture"
+
+					log.Severity = ""
+					log.Tags = ""
+					log.Message = ""
+
+					log.Enforcer = "eBPF Monitor"
+					log.Action = "Audit"
+				}
+
+			case "Device":
+				if secPolicy.Operation != log.Operation {
+					continue
+				}
+
+				// skip logs of USB devices connected before KubeArmor starts
+				if log.Action == "Audit (Already Connected)" {
+					log.Action = "Audit"
+					continue
+				}
+
+				matchedFlags := matchDeviceResource(log.Resource, secPolicy.Resource)
+				sp := getDevicePolicySpecificity(secPolicy)
+
+				if matchedFlags && sp > specificity {
+
+					if secPolicy.Action == "Block" && log.Result != "Passed" {
+						// block policy
+						// matched resource + matched action + expected result -> alert
+
+						log.Type = "MatchedPolicy"
+
+						log.PolicyName = secPolicy.PolicyName
+						log.Severity = secPolicy.Severity
+
+						if len(secPolicy.Tags) > 0 {
+							log.Tags = strings.Join(secPolicy.Tags[:], ",")
+						}
+
+						if len(secPolicy.Message) > 0 {
+							log.Message = secPolicy.Message
+						}
+
+						log.Enforcer = "USBDeviceHandler"
+						log.Action = "Block"
+
+						// if policy matched, update specificity
+						specificity = sp
+						continue
+					}
+
+					if secPolicy.Action == "Audit" && log.Result == "Passed" {
+						// audit policy
+						// matched resource + matched action + expected result -> alert (audit log)
+
+						log.Type = "MatchedPolicy"
+
+						log.PolicyName = secPolicy.PolicyName
+						log.Severity = secPolicy.Severity
+
+						if len(secPolicy.Tags) > 0 {
+							log.Tags = strings.Join(secPolicy.Tags[:], ",")
+							log.ATags = secPolicy.Tags
+						}
+
+						if len(secPolicy.Message) > 0 {
+							log.Message = secPolicy.Message
+						}
+
+						log.Enforcer = "USBDeviceHandler"
+						log.Action = "Audit"
+
+						specificity = sp
+						continue
+					}
+
+					if secPolicy.Action == "Allow" && log.Result == "Passed" {
+						// allow policy
+						// matched resource + matched action + expected result -> going to be skipped
+
+						log.Type = "MatchedPolicy"
+
+						log.PolicyName = secPolicy.PolicyName
+						log.Severity = secPolicy.Severity
+
+						if len(secPolicy.Tags) > 0 {
+							log.Tags = strings.Join(secPolicy.Tags[:], ",")
+							log.ATags = secPolicy.Tags
+						}
+
+						if len(secPolicy.Message) > 0 {
+							log.Message = secPolicy.Message
+						}
+
+						log.Enforcer = "USBDeviceHandler"
+						log.Action = "Allow"
+
+						specificity = sp
+						continue
+					}
+				}
+
+			case "NetworkFirewall":
+				if secPolicy.Operation != log.Operation {
+					continue
+				}
+
+				parts := strings.Split(log.Resource, " ") // policyName chain(INPUT/OUTPUT) action(Audit/Block)
+				action := "Block"
+
+				if secPolicy.PolicyName == parts[0] {
+					log.Type = "MatchedPolicy"
+
+					log.PolicyName = secPolicy.PolicyName
+					log.Severity = secPolicy.Severity
+
+					if len(secPolicy.Tags) > 0 {
+						log.Tags = strings.Join(secPolicy.Tags[:], ",")
+						log.ATags = secPolicy.Tags
+					}
+
+					if len(secPolicy.Message) > 0 {
+						log.Message = secPolicy.Message
+					}
+
+					log.Enforcer = "NetworkPolicyEnforcer"
+
+					log.Action = action
+					if len(parts) > 2 {
+						log.Action = parts[2]
+					}
+				} else if parts[0] == "Default" { // Default Posture
+					log.Type = "MatchedPolicy"
+
+					log.PolicyName = "DefaultPosture"
+
+					log.Severity = ""
+					log.Tags = ""
+					log.Message = ""
+
+					log.Enforcer = "NetworkPolicyEnforcer"
+
+					log.Action = action
+					if len(parts) > 2 {
+						log.Action = parts[2]
+					}
+				}
+
+			case "Capabilities":
+				if secPolicy.Operation != log.Operation {
+					continue
+				}
+				// match sources
+				if (!secPolicy.IsFromSource) || (secPolicy.IsFromSource && (strings.HasPrefix(log.Source, secPolicy.Source+" ") || secPolicy.Source == log.ProcessName)) {
+					skip := false
+
+					for matchCapability := range strings.SplitSeq(secPolicy.Resource, ",") {
+						if skip {
+							break
+						}
+
+						// match resources
+
+						if strings.Contains(log.Resource, matchCapability) {
+
+							if (secPolicy.Action == "Allow" || secPolicy.Action == "Audit (Allow)") && log.Result == "Passed" {
+								// allow policy or allow policy with audit mode
+								// matched source + matched resource + matched action + expected result -> going to be skipped
+
+								log.Type = "MatchedPolicy"
+
+								log.PolicyName = secPolicy.PolicyName
+								log.Severity = secPolicy.Severity
+
+								if len(secPolicy.Tags) > 0 {
+									log.Tags = strings.Join(secPolicy.Tags[:], ",")
+									log.ATags = secPolicy.Tags
+								}
+
+								if len(secPolicy.Message) > 0 {
+									log.Message = secPolicy.Message
+								}
+
+								if log.PolicyEnabled == tp.KubeArmorPolicyAudited {
+									log.Enforcer = "eBPF Monitor"
+								} else {
+									log.Enforcer = fd.GetEnforcer()
+								}
+
+								log.Action = "Allow"
+
+								skip = true
+								continue
+							}
+
+							if secPolicy.Action == "Audit" && log.Result == "Passed" {
+								// audit policy
+								// matched source + matched resource + matched action + expected result -> alert (audit log)
+
+								log.Type = "MatchedPolicy"
+
+								log.PolicyName = secPolicy.PolicyName
+								log.Severity = secPolicy.Severity
+
+								if len(secPolicy.Tags) > 0 {
+									log.Tags = strings.Join(secPolicy.Tags[:], ",")
+									log.ATags = secPolicy.Tags
+								}
+
+								if len(secPolicy.Message) > 0 {
+									log.Message = secPolicy.Message
+								}
+
+								log.Enforcer = "eBPF Monitor"
+								log.Action = secPolicy.Action
+
+								skip = true
+								continue
+							}
+
+							if (secPolicy.Action == "Block" && log.Result != "Passed") ||
+								(secPolicy.Action == "Audit (Block)" && log.Result == "Passed") {
+								// block policy or block policy with audit mode
+								// matched source + matched resource + matched action + expected result -> alert
+
+								log.Type = "MatchedPolicy"
+
+								log.PolicyName = secPolicy.PolicyName
+								log.Severity = secPolicy.Severity
+
+								if len(secPolicy.Tags) > 0 {
+									log.Tags = strings.Join(secPolicy.Tags[:], ",")
+								}
+
+								if len(secPolicy.Message) > 0 {
+									log.Message = secPolicy.Message
+								}
+
+								if log.PolicyEnabled == tp.KubeArmorPolicyAudited {
+									log.Enforcer = "eBPF Monitor"
+								} else {
+									log.Enforcer = fd.GetEnforcer()
+								}
+
+								log.Action = secPolicy.Action
+
+								skip = true
+								continue
+							}
+						}
+					}
+
+					if skip {
+						continue
+					}
+
+					if secPolicy.Action == "Allow" && log.Result != "Passed" {
+						// matched source + !(matched resource) + action = allow + result = blocked -> allow policy violation
+
+						log.Type = "MatchedPolicy"
+
+						log.PolicyName = "DefaultPosture"
+
+						log.Severity = ""
+						log.Tags = ""
+						log.Message = ""
+
+						log.Enforcer = "eBPF Monitor"
+						log.Action = "Block"
+
+						continue
+					}
+
+					if secPolicy.Action == "Audit (Allow)" && log.Result == "Passed" {
+						// matched source + !(matched resource) + action = audit (allow) + result = passed -> allow policy violation (audit mode)
+
+						log.Type = "MatchedPolicy"
+
+						log.PolicyName = "DefaultPosture"
+
+						log.Severity = ""
+						log.Tags = ""
+						log.Message = ""
+
+						log.Enforcer = "eBPF Monitor"
+
+						if fd.DefaultPostures[log.NamespaceName].CapabilitiesAction == "block" {
+							log.Action = "Audit (Block)"
+						} else { // fd.DefaultPostures[log.NamespaceName].CapabilitiesAction == "audit"
+							log.Action = "Audit"
+						}
+
+						continue
+					}
+				}
+
+				if fd.DefaultPostures[log.NamespaceName].CapabilitiesAction == "block" && secPolicy.Action == "Audit (Allow)" && log.Result == "Passed" {
+					// defaultPosture = block + audit mode
+
+					log.Type = "MatchedPolicy"
+
+					log.PolicyName = "DefaultPosture"
+
+					log.Severity = ""
+					log.Tags = ""
+					log.Message = ""
+
+					log.Enforcer = "eBPF Monitor"
+					log.Action = "Audit (Block)"
+				}
+
+				if fd.DefaultPostures[log.NamespaceName].CapabilitiesAction == "audit" && (secPolicy.Action == "Allow" || secPolicy.Action == "Audit (Allow)") && log.Result == "Passed" {
+					// defaultPosture = audit
+
+					log.Type = "MatchedPolicy"
+
+					log.PolicyName = "DefaultPosture"
+
+					log.Severity = ""
+					log.Tags = ""
+					log.Message = ""
+
+					log.Enforcer = "eBPF Monitor"
+					log.Action = "Audit"
+				}
+
+			case "Syscall":
+				if secPolicy.Operation != log.Operation {
+					continue
+				}
+				//Get syscall
+				syscallName := strings.Split(strings.Split(log.Data, " ")[0], "SYS_")[1]
+				//Get syscall Source
+				syscallSource := strings.Split(log.Source, " ")[0]
+				matchedRule := false
+				if syscallName == secPolicy.ResourceType {
+					matchPath := false
+					fromSource := false
+					if secPolicy.IsFromSource &&
+						(((strings.HasPrefix(syscallSource, secPolicy.Source) && secPolicy.Source[len(secPolicy.Source)-1] == '/') && // match dir
+							(secPolicy.Recursive || !strings.Contains(syscallSource[len(secPolicy.Source):], "/"))) || // handle recursive dir
+							secPolicy.Source == syscallSource) { // match file
+						fromSource = true
+					}
+
+					if len(secPolicy.Resource) > 0 &&
+						((secPolicy.Resource[len(secPolicy.Resource)-1] == '/' && ((strings.HasPrefix(log.Resource, secPolicy.Resource) && secPolicy.ReadOnly) || secPolicy.Resource[:len(secPolicy.Resource)-1] == log.Resource)) || //match dir
+							secPolicy.Resource == log.Resource) { // match path
+						matchPath = true
+					}
+					matchedRule = (len(secPolicy.Resource) == 0 || matchPath) && (!secPolicy.IsFromSource || fromSource)
+
+					if matchedRule {
+						log.Type = "MatchedPolicy"
+						log.PolicyName = secPolicy.PolicyName
+						log.Severity = secPolicy.Severity
+						if len(secPolicy.Tags) > 0 {
+							log.Tags = strings.Join(secPolicy.Tags[:], ",")
+						}
+
+						if len(secPolicy.Message) > 0 {
+							log.Message = secPolicy.Message
+						}
+						log.Action = "Audit" // Syscall rules are always in audit mode
+					}
+				}
+
+			}
+		}
+
+		fd.SecurityPoliciesLock.RUnlock()
+
+	}
+
+	if log.ContainerID != "" { // container
+		if log.Type == "" {
+			// defaultPosture (audit) or container log
+
+			if _, ok := fd.DefaultPostures[log.NamespaceName]; !ok {
+				globalDefaultPosture := tp.DefaultPosture{
+					FileAction:         cfg.GlobalCfg.DefaultFilePosture,
+					NetworkAction:      cfg.GlobalCfg.DefaultNetworkPosture,
+					CapabilitiesAction: cfg.GlobalCfg.DefaultCapabilitiesPosture,
+				}
+				fd.DefaultPostures[log.NamespaceName] = globalDefaultPosture
+			}
+
+			if log.Operation == "Process" {
+				if setLogFields(&log, existFileAllowPolicy, fd.DefaultPostures[log.NamespaceName].FileAction, log.ProcessVisibilityEnabled, true, false) {
+					return log
+				}
+			} else if log.Operation == "File" {
+				if setLogFields(&log, existFileAllowPolicy, fd.DefaultPostures[log.NamespaceName].FileAction, log.FileVisibilityEnabled, true, false) {
+					return log
+				}
+			} else if log.Operation == "Network" {
+				if setLogFields(&log, existNetworkAllowPolicy, fd.DefaultPostures[log.NamespaceName].NetworkAction, log.NetworkVisibilityEnabled, true, false) {
+					return log
+				}
+			} else if log.Operation == "Capabilities" {
+				if setLogFields(&log, existCapabilitiesAllowPolicy, fd.DefaultPostures[log.NamespaceName].CapabilitiesAction, log.CapabilitiesVisibilityEnabled, true, false) {
+					return log
+				}
+			} else if log.Operation == "Syscall" {
+				if setLogFields(&log, false, "", true, true, false) {
+					return log
+				}
+			}
+
+		} else if log.Type == "MatchedPolicy" {
+			if log.Action == "Allow" && log.Result == "Passed" {
+				return tp.Log{}
+			}
+
+			return log
+		}
+	} else { // host
+		if log.Type == "" {
+			// host log
+			if log.Operation == "Process" {
+				if setLogFields(&log, existFileAllowPolicy, cfg.GlobalCfg.DefaultFilePosture, fd.Node.ProcessVisibilityEnabled, false, false) {
+					return log
+				}
+			} else if log.Operation == "File" {
+				if setLogFields(&log, existFileAllowPolicy, cfg.GlobalCfg.DefaultFilePosture, fd.Node.FileVisibilityEnabled, false, false) {
+					return log
+				}
+			} else if log.Operation == "Network" {
+				if setLogFields(&log, existNetworkAllowPolicy, cfg.GlobalCfg.DefaultNetworkPosture, fd.Node.NetworkVisibilityEnabled, false, false) {
+					return log
+				}
+			} else if log.Operation == "Capabilities" {
+				if setLogFields(&log, existCapabilitiesAllowPolicy, cfg.GlobalCfg.DefaultCapabilitiesPosture, fd.Node.CapabilitiesVisibilityEnabled, false, false) {
+					return log
+				}
+			} else if log.Operation == "Device" {
+				if setLogFields(&log, existUSBDeviceAllowPolicy, cfg.GlobalCfg.HostDefaultDevicePosture, true, false, false) {
+					return log
+				}
+			} else if log.Operation == "NetworkFirewall" {
+				if setLogFields(&log, existNetworkFirewallAllowPolicy, cfg.GlobalCfg.HostDefaultNetworkPosture, true, false, true) {
+					return log
+				}
+			}
+		} else if log.Type == "MatchedPolicy" {
+			log.Type = "MatchedHostPolicy"
+
+			if log.Action == "Allow" && log.Result == "Passed" {
+				return tp.Log{}
+			}
+
+			return log
+		}
+	}
+
+	return tp.Log{}
+}

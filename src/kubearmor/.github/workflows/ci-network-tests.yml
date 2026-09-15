@@ -1,0 +1,267 @@
+name: ci-network-test-ginkgo
+
+on:
+  workflow_call:
+
+# Declare default permissions as read only.
+permissions: read-all
+
+jobs:
+  build:
+    name: Auto-testing Framework / ${{ matrix.os }} / ${{ matrix.runtime }}
+    runs-on: ${{ matrix.os }}
+    env:
+      RUNTIME: ${{ matrix.runtime }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: apparmor
+            runtime: containerd
+          - os: bpflsm
+            runtime: crio
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: "KubeArmor/go.mod"
+
+      - name: Check what paths were updated
+        uses: dorny/paths-filter@4512585405083f25c027a35db413c2b3b9006d50 # v2
+        id: filter
+        with:
+          filters: |
+            controller:
+              - 'pkg/KubeArmorController/**'
+            multiubuntu:
+              - 'examples/multiubuntu/build/**'
+
+      - name: Install the latest LLVM toolchain
+        run: ./.github/workflows/install-llvm.sh
+
+      - name: Compile libbpf
+        run: ./.github/workflows/install-libbpf.sh
+
+      - name: Install bpftool
+        run: ./.github/workflows/install-bpftool.sh
+
+      - name: Generate vmlinux.h
+        run: make -C BPF kernel_headers
+        working-directory: KubeArmor
+
+      - name: Generate BPF files
+        run: go generate ./...
+        working-directory: KubeArmor
+
+      - name: Setup a Kubernetes environment
+        run: ./.github/workflows/install-k3s.sh
+
+      - name: Generate KubeArmor artifacts
+        run: |
+          export IS_COVERAGE=true
+          GITHUB_SHA=$GITHUB_SHA ./KubeArmor/build/build_kubearmor.sh
+
+      - name: Build Kubearmor-Operator
+        working-directory: pkg/KubeArmorOperator
+        run: |
+          make docker-build
+
+      - name: Build KubeArmorController
+        if: steps.filter.outputs.controller == 'true'
+        run: make -C pkg/KubeArmorController/ docker-build TAG=latest
+
+      - name: Build multiubuntu docker image
+        working-directory: examples/multiubuntu/build
+        if: steps.filter.outputs.multiubuntu == 'true'
+        run: docker build -t kubearmor/ubuntu-w-utils:latest .
+
+      - name: make changes in multiubuntu-deployment
+        working-directory: tests/k8s_env
+        if: steps.filter.outputs.multiubuntu == 'true'
+        run: |
+          grep -rl "kubearmor/ubuntu-w-utils:latest" ./ | while read -r file; do sed -i 's/imagePullPolicy: Always/imagePullPolicy: Never/g' "$file"; done
+
+      - name: Run KubeArmor
+        timeout-minutes: 10
+        run: |
+          if [[ ${{ matrix.runtime }} == "containerd" ]]; then
+            docker save kubearmor/kubearmor-test-init:latest | sudo k3s ctr images import -
+            docker save kubearmor/kubearmor-test:latest | sudo k3s ctr images import -
+            docker save kubearmor/kubearmor-operator:latest | sudo k3s ctr images import -
+            docker save kubearmor/kubearmor-snitch:latest | sudo k3s ctr images import -
+            
+            if [[ ${{ steps.filter.outputs.controller }} == 'true' ]]; then 
+              docker save kubearmor/kubearmor-controller:latest | sudo k3s ctr images import -
+            fi
+            if [[ ${{ steps.filter.outputs.multiubuntu }} == 'true' ]]; then
+              docker save kubearmor/ubuntu-w-utils:latest | sudo k3s ctr images import -
+            fi
+          else
+            if [ ${{ matrix.runtime }} == "crio" ]; then
+              docker save kubearmor/kubearmor-test-init:latest | sudo podman load
+              sudo podman tag docker.io/kubearmor/kubearmor-test-init:latest kubearmor/kubearmor-test-init:latest
+
+              docker save kubearmor/kubearmor-test:latest | sudo podman load
+              sudo podman tag docker.io/kubearmor/kubearmor-test:latest kubearmor/kubearmor-test:latest
+
+              docker save kubearmor/kubearmor-operator:latest | sudo podman load
+              sudo podman tag docker.io/kubearmor/kubearmor-operator:latest kubearmor/kubearmor-operator:latest
+
+              docker save kubearmor/kubearmor-snitch:latest | sudo podman load
+              sudo podman tag docker.io/kubearmor/kubearmor-snitch:latest kubearmor/kubearmor-snitch:latest
+
+              if [ ${{ steps.filter.outputs.controller }} == 'true' ]; then
+                docker save kubearmor/kubearmor-controller:latest | sudo podman load
+                sudo podman tag docker.io/kubearmor/kubearmor-controller:latest kubearmor/kubearmor-controller:latest
+
+              fi
+              if [ ${{ steps.filter.outputs.multiubuntu }} == 'true' ]; then
+                docker save kubearmor/ubuntu-w-utils:latest | sudo podman load
+                sudo podman tag docker.io/kubearmor/ubuntu-w-utils:latest kubearmor/ubuntu-w-utils:latest
+              fi
+              echo "Podman images"
+              sudo podman images -a
+            fi
+          fi
+
+          docker system prune -a -f 
+          docker buildx prune -a -f
+          helm upgrade --install kubearmor-operator ./deployments/helm/KubeArmorOperator -n kubearmor --create-namespace --set kubearmorOperator.image.tag=latest  --set kubearmorOperator.annotateExisting=true
+
+          kubectl rollout status --timeout=5m deployment -n kubearmor -l kubearmor-app=kubearmor-operator
+
+          kubectl get pods -A
+          if [[ ${{ steps.filter.outputs.controller }} == 'true' ]]; then
+            kubectl apply -f pkg/KubeArmorOperator/config/samples/kubearmor-coverage.yaml --dry-run=client -o json | \
+            jq '.spec.kubearmorControllerImage.imagePullPolicy = "Never"' | \
+            kubectl apply -f -
+          else 
+            kubectl apply -f pkg/KubeArmorOperator/config/samples/kubearmor-coverage.yaml
+          fi
+
+          kubectl wait -n kubearmor --timeout=5m --for=jsonpath='{.status.phase}'=Running kubearmorconfigs/kubearmorconfig-test
+
+          while [ ! "$(kubectl wait --timeout=5s --for=condition=ready pod -l kubearmor-app,kubearmor-app!=kubearmor-snitch -n kubearmor >/dev/null 2>&1; echo $?)" -eq 0 ]; do
+            kubectl rollout status --timeout=5m deployment -n kubearmor -l kubearmor-app,kubearmor-app!=kubearmor-controller -n kubearmor
+            kubectl rollout status --timeout=5m daemonset -l kubearmor-app=kubearmor -n kubearmor
+            kubectl rollout status --timeout=5m deployment -n kubearmor -l kubearmor-app=kubearmor-controller -n kubearmor
+            kubectl get pods -A
+          done
+
+          sleep 10
+          DAEMONSET_NAME=$(kubectl get daemonset -n kubearmor -o jsonpath='{.items[0].metadata.name}')
+          echo "DaemonSet: $DAEMONSET_NAME"
+
+          kubectl patch daemonset $DAEMONSET_NAME -n kubearmor --type='json' -p='[
+            {
+              "op": "add",
+              "path": "/spec/template/spec/volumes/-",
+              "value": {
+                "name": "coverage-storage",
+                "hostPath": {
+                  "path": "/coverage",
+                  "type": "DirectoryOrCreate"
+                }
+              }
+            },
+            {
+              "op": "add",
+              "path": "/spec/template/spec/containers/0/volumeMounts/-",
+              "value": {
+                "mountPath": "/coverage",
+                "name": "coverage-storage"
+              }
+            },
+            {
+              "op": "add",
+              "path": "/spec/template/spec/containers/0/args/-",
+              "value": "-test.coverprofile=/coverage/coverage_k8s_${{ matrix.os }}_${{ matrix.runtime }}.out"
+            }
+          ]'
+
+          sleep 15
+
+      - name: Get KubeArmor POD info
+        run: |
+          DAEMONSET_NAME=$(kubectl get daemonset -n kubearmor -o jsonpath='{.items[0].metadata.name}')
+          LABEL_SELECTOR=$(kubectl get daemonset $DAEMONSET_NAME -n kubearmor -o jsonpath='{.spec.selector.matchLabels}' | jq -r 'to_entries[] | "\(.key)=\(.value)"' | paste -sd, -)
+          POD_NAME=$(kubectl get pods -n kubearmor -l "$LABEL_SELECTOR" -o jsonpath='{.items[*].metadata.name}')
+          echo "Pod: $POD_NAME"
+          echo "POD_NAME=$POD_NAME" >> $GITHUB_ENV
+
+      - name: Test KubeArmor using Ginkgo
+        run: |
+          go install -mod=mod github.com/onsi/ginkgo/v2/ginkgo@9ff1646a26f77a4c0d33ddba3e6368c42c0e8842
+          go mod tidy
+          ginkgo --vv --flake-attempts=10 --timeout=15m
+        working-directory: ./tests/k8s_env/networktests
+        timeout-minutes: 30
+
+      - name: Kill KubeArmor process in the pod
+        run: |
+          KUBEARMOR_PID=$(kubectl exec ${{ env.POD_NAME }} -n kubearmor -c kubearmor -- sh -c "ps aux | grep '[K]ubeArmor/kubearmor-test' | awk '{print \$1}'")
+          kubectl exec ${{ env.POD_NAME }} -n kubearmor -c kubearmor -- sh -c "kill -s SIGINT $KUBEARMOR_PID"
+          sleep 10
+        env:
+          POD_NAME: ${{ env.POD_NAME }}
+
+      - name: Extract coverage file
+        run: |
+          for i in {1..24}; do
+            if [ -f /coverage/coverage_k8s_${{ matrix.os }}_${{ matrix.runtime }}.out ]; then
+              cp /coverage/coverage_k8s_${{ matrix.os }}_${{ matrix.runtime }}.out coverage_k8s_${{ matrix.os }}_${{ matrix.runtime }}.out
+              break
+            fi
+            sleep 5
+          done
+          ls -l
+        working-directory: KubeArmor
+
+      - name: Get karmor sysdump
+        if: ${{ failure() }}
+        run: |
+          kubectl describe pod -n kubearmor -l kubearmor-app=kubearmor
+          curl -sfL http://get.kubearmor.io/ -o /tmp/install-karmor.sh && sudo sh /tmp/install-karmor.sh -b /usr/local/bin
+          mkdir -p /tmp/kubearmor/ && cd /tmp/kubearmor && karmor sysdump
+
+      - name: Archive log artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kubearmor.logs
+          path: |
+            /tmp/kubearmor/
+            /tmp/kubearmor.*
+
+      - name: Measure code coverage
+        if: ${{ always() }}
+        run: |
+          go install github.com/modocache/gover@v0.0.0-20171022184752-b58185e213c5
+          ls -l
+          if [ -f coverage_k8s_${{ matrix.os }}_${{ matrix.runtime }}.out ]; then
+            gover
+            go tool cover -func coverage_k8s_${{ matrix.os }}_${{ matrix.runtime }}.out
+          else
+            echo "Coverage file not found, skipping coverage report."
+          fi
+        working-directory: KubeArmor
+        env:
+          GOPATH: /home/vagrant/go
+      - uses: codecov/codecov-action@ab904c41d6ece82784817410c45d8b8c02684457 # v3
+        if: ${{ always() }}
+        with:
+          files: ./KubeArmor/gover.coverprofile
+
+      - name: Upload coverage file
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-k8s-${{ matrix.os }}-${{ matrix.runtime }}
+          path: KubeArmor/coverage_k8s_${{ matrix.os }}_${{ matrix.runtime }}.out
+
+      - name: Run cleanup
+        if: ${{ always() }}
+        run: ./.github/workflows/cleanup.sh

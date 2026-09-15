@@ -1,0 +1,173 @@
+name: ci-systemd-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag which has to be updated"
+        type: "string"
+        required: true
+  push:
+    tags:
+      - "*"
+
+# Declare default permissions as read only.
+permissions: read-all
+
+jobs:
+  goreleaser:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-22.04
+          - arch: arm64
+            os: ubuntu-22.04-arm
+    if: github.repository == 'kubearmor/kubearmor'
+    permissions:
+      id-token: write
+      contents: write
+    outputs:
+      checksums-sha256: ${{ steps.compute-hash.outputs.hash }}
+      release-tag: ${{ steps.vars.outputs.GORELEASER_CURRENT_TAG }}
+    steps:
+      - name: Validate version
+        id: validate
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        with:
+          script: |
+            const Regex = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
+            const eventName = '${{ github.event_name }}';
+            let version;
+            if (eventName === 'push') {
+              version = '${{ github.ref_name }}';
+            } else {
+              version = '${{ inputs.tag }}';
+            }
+            if (!Regex.test(version)) {
+              core.setFailed(`Invalid version format: ${version}`);
+            } else {
+              core.setOutput('release_tag', version);
+            }
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34
+        with:
+          go-version-file: "KubeArmor/go.mod"
+
+      - name: Install the latest LLVM toolchain
+        run: ./.github/workflows/install-llvm.sh
+
+      - name: Compile libbpf
+        run: ./.github/workflows/install-libbpf.sh
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da
+
+      - name: Install karmor
+        run: curl -sfL https://raw.githubusercontent.com/kubearmor/kubearmor-client/main/install.sh -o /tmp/install-karmor.sh && sudo sh /tmp/install-karmor.sh -b .
+        working-directory: KubeArmor
+
+      - name: Prepare environment from validated tag
+        id: vars
+        run: |
+          RELEASE_TAG="${{ steps.validate.outputs.release_tag }}"
+          echo "GORELEASER_CURRENT_TAG=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+          echo "tag=${RELEASE_TAG#v}" >> $GITHUB_OUTPUT
+          cp KubeArmor/.goreleaser.yaml /tmp/.goreleaser.yaml
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            git checkout "${RELEASE_TAG}"
+          fi
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_AUTHTOK }}
+
+      - name: Build KubeArmor object files
+        run: |
+          make
+          cd ..
+          go generate ./...
+        working-directory: KubeArmor/BPF
+
+      - name: Install yq
+        run: |
+          wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${{ matrix.arch }} -O /usr/local/bin/yq &&\
+          chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Patch goarch
+        working-directory: KubeArmor
+        run: |
+          yq -i '.builds[0].goarch = ["${{ matrix.arch }}"]' /tmp/.goreleaser.yaml
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
+        with:
+          distribution: goreleaser
+          version: v1.25.0
+          args: release --config=/tmp/.goreleaser.yaml --skip-validate --clean
+          workdir: KubeArmor
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.vars.outputs.GORELEASER_CURRENT_TAG }}
+          ARCH: ${{ matrix.arch }}
+          COSIGN_YES: "true"
+
+      - name: Sign release artifacts with cosign
+        working-directory: KubeArmor/dist
+        env:
+          COSIGN_YES: "true"
+        run: |
+          for f in *.tar.gz *.deb *.rpm *.txt; do
+            cosign sign-blob "$f" \
+              --bundle "${f}.sigstore.json" \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem"
+          done
+
+      - name: Upload .sig and .pem to GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: KubeArmor/dist
+        run: |
+          gh release upload "${{ steps.vars.outputs.GORELEASER_CURRENT_TAG }}" \
+            *.sig \
+            *.pem \
+            --clobber
+
+      - name: Compute checksums hash for provenance
+        id: compute-hash
+        working-directory: KubeArmor/dist
+        run: |
+          CHECKSUM_FILE="kubearmor_${{ steps.vars.outputs.tag }}_${{ matrix.arch }}_checksums.txt"
+          echo "hash=$(sha256sum ${CHECKSUM_FILE} | base64 -w0)" >> $GITHUB_OUTPUT
+
+      - name: Setup ORAS
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6
+        with:
+          version: 1.0.0
+
+      - name: Publish release artifacts to Dockerhub
+        working-directory: KubeArmor/dist
+        run: |
+          oras push docker.io/kubearmor/kubearmor-systemd:${{ steps.vars.outputs.tag }}_linux-${{ matrix.arch }} kubearmor_${{ steps.vars.outputs.tag }}_linux-${{ matrix.arch }}.tar.gz
+
+  provenance:
+    needs: [goreleaser]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: "${{ needs.goreleaser.outputs.checksums-sha256 }}"
+      upload-assets: true
+      upload-tag-name: ${{ needs.goreleaser.outputs.release-tag }}

@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Authors of KubeArmor
+
+### Builder
+
+FROM golang:1.26-alpine3.22@sha256:28d89ee9cc0ff9fec75c82ca201e6bf7fdf9a679d4b7b24dfa04f2bb766bb468 AS builder
+
+RUN apk --no-cache update && apk upgrade --no-cache libcrypto3 libssl3 zlib libexpat
+RUN apk add --no-cache git clang llvm make gcc protobuf protobuf-dev curl elfutils-dev libbpf-dev
+
+WORKDIR /usr/src/KubeArmor
+
+COPY KubeArmor/go.mod KubeArmor/go.sum ./KubeArmor/
+COPY pkg/ ./pkg/
+COPY protobuf/ ./protobuf/
+WORKDIR /usr/src/KubeArmor/KubeArmor
+RUN go mod download && go mod verify
+
+WORKDIR /usr/src/KubeArmor
+
+COPY . .
+
+WORKDIR /usr/src/KubeArmor/KubeArmor
+
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+RUN go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
+RUN go install github.com/ahmetb/govvv@v0.3.0
+
+RUN make
+
+WORKDIR /usr/src/KubeArmor/BPF
+
+# install bpftool  
+RUN arch=$(uname -m) bpftool_version=v7.3.0 && \
+    if [[ "$arch" == "aarch64" ]]; then \
+        arch=arm64; \
+    elif [[ "$arch" == "x86_64" ]]; then \
+        arch=amd64; \   
+    fi && \
+    curl -LO https://github.com/libbpf/bpftool/releases/download/$bpftool_version/bpftool-$bpftool_version-$arch.tar.gz && \
+    tar -xzf bpftool-$bpftool_version-$arch.tar.gz -C /usr/local/bin && \
+    chmod +x /usr/local/bin/bpftool
+
+WORKDIR /usr/src/KubeArmor/KubeArmor
+
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+RUN go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
+
+RUN make
+
+WORKDIR /usr/src/KubeArmor/BPF
+
+COPY ./KubeArmor/BPF .
+
+RUN make
+
+### Builder test
+
+FROM builder AS builder-test
+WORKDIR /usr/src/KubeArmor/KubeArmor
+RUN CGO_ENABLED=0 go test -covermode=atomic -coverpkg=./... -c . -o kubearmor-test
+
+### Make executable image
+
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS kubearmor
+
+RUN apk --no-cache update && \
+    apk upgrade --no-cache libcrypto3 libssl3 zlib libexpat && \
+    apk add --no-cache musl musl-utils perl
+
+RUN apk add --no-cache apparmor apparmor-utils bash nftables
+
+COPY --from=builder /usr/src/KubeArmor/KubeArmor/kubearmor /KubeArmor/kubearmor
+COPY --from=builder /usr/src/KubeArmor/BPF/*.o /opt/kubearmor/BPF/
+COPY --from=builder /usr/src/KubeArmor/KubeArmor/templates/* /KubeArmor/templates/
+
+ENTRYPOINT ["/KubeArmor/kubearmor"]
+
+FROM kubearmor AS kubearmor-test
+COPY --from=builder-test /usr/src/KubeArmor/KubeArmor/kubearmor-test /KubeArmor/kubearmor-test
+
+ENTRYPOINT ["/KubeArmor/kubearmor-test"]
+
+### TODO ###
+
+### build apparmor_parser binary
+
+## debian:10 uses glibc2.28 version similar to ubi9
+# FROM debian:10 AS apparmor-builder
+# RUN apt-get update && apt-get install -y apparmor
+# RUN mkdir /tmp/apparmor && \
+#     cp /sbin/apparmor_parser /tmp/apparmor/
+
+### Make UBI-based executable image
+
+FROM redhat/ubi10-minimal@sha256:3948fdfe71007909b37faf48c52eda28bfab7c4e440d6f4d4619422d06ceeb4c AS kubearmor-ubi
+
+ARG VERSION=latest
+ENV KUBEARMOR_UBI=true
+
+LABEL name="kubearmor" \
+      vendor="KubeArmor" \
+      maintainer="Achref Ben Saad, Aryan Sharma, Aryan Bakliwal" \
+      version=${VERSION} \
+      release=${VERSION} \
+      summary="kubearmor container image based on redhat ubi" \
+      description="KubeArmor is a cloud-native runtime security enforcement system that restricts the behavior \
+                  (such as process execution, file access, and networking operations) of pods, containers, and nodes (VMs) \
+                  at the system level."
+
+RUN microdnf -y update && \
+    microdnf -y install --nodocs --setopt=install_weak_deps=0 --setopt=keepcache=0 shadow-utils procps libcap nftables && \
+    microdnf clean all
+
+RUN groupadd --gid 1000 default \
+  && useradd --uid 1000 --gid default --shell /bin/bash --create-home default
+
+COPY LICENSE /licenses/license.txt
+COPY --from=builder --chown=default:default /usr/src/KubeArmor/KubeArmor/kubearmor /KubeArmor/kubearmor
+COPY --from=builder --chown=default:default /usr/src/KubeArmor/BPF/*.o /opt/kubearmor/BPF/
+COPY --from=builder --chown=default:default /usr/src/KubeArmor/KubeArmor/templates/* /KubeArmor/templates/
+
+# TODO
+# COPY --from=apparmor-builder /tmp/apparmor/apparmor_parser /usr/sbin/
+# RUN chmod u+s /usr/sbin/apparmor_parser
+
+RUN setcap "cap_sys_admin=ep cap_sys_ptrace=ep cap_ipc_lock=ep cap_sys_resource=ep cap_dac_override=ep cap_dac_read_search=ep cap_net_admin=ep" /KubeArmor/kubearmor
+
+USER 1000
+ENTRYPOINT ["/KubeArmor/kubearmor"]
+
+### Make UBI-based test executable image for coverage calculation
+FROM redhat/ubi10-minimal@sha256:3948fdfe71007909b37faf48c52eda28bfab7c4e440d6f4d4619422d06ceeb4c AS kubearmor-ubi-test
+
+ARG VERSION=latest
+ENV KUBEARMOR_UBI=true
+
+LABEL name="kubearmor" \
+      vendor="KubeArmor" \
+      maintainer="Achref Ben Saad, Aryan Sharma, Aryan Bakliwal" \
+      version=${VERSION} \
+      release=${VERSION} \
+      summary="kubearmor container image based on redhat ubi" \
+      description="KubeArmor is a cloud-native runtime security enforcement system that restricts the behavior \
+                  (such as process execution, file access, and networking operations) of pods, containers, and nodes (VMs) \
+                  at the system level."
+
+RUN microdnf -y update && \
+    microdnf -y install --nodocs --setopt=install_weak_deps=0 --setopt=keepcache=0 shadow-utils procps libcap nftables && \
+    microdnf clean all
+
+RUN groupadd --gid 1000 default \
+  && useradd --uid 1000 --gid default --shell /bin/bash --create-home default
+
+COPY LICENSE /licenses/license.txt
+COPY --from=builder --chown=default:default /usr/src/KubeArmor/KubeArmor/kubearmor /KubeArmor/kubearmor
+COPY --from=builder --chown=default:default /usr/src/KubeArmor/BPF/*.o /opt/kubearmor/BPF/
+COPY --from=builder --chown=default:default /usr/src/KubeArmor/KubeArmor/templates/* /KubeArmor/templates/
+COPY --from=builder-test --chown=default:default /usr/src/KubeArmor/KubeArmor/kubearmor-test /KubeArmor/kubearmor-test
+
+RUN setcap "cap_sys_admin=ep cap_sys_ptrace=ep cap_ipc_lock=ep cap_sys_resource=ep cap_dac_override=ep cap_dac_read_search=ep cap_net_admin=ep" /KubeArmor/kubearmor-test
+
+USER 1000
+ENTRYPOINT ["/KubeArmor/kubearmor-test"]
