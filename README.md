@@ -1,4 +1,22 @@
-# AgentReins Linux
+<div align="center">
+  <img src="branding/agentreins-linux-x-launch.png" width="100%" alt="AgentReins Linux — See. Understand. Control.">
+
+  # AgentReins Linux
+
+  **Kernel-aware runtime security and natural-language control for high-privilege agents.**
+
+  [![Linux](https://img.shields.io/badge/platform-Linux-111827?logo=linux&logoColor=white)](#)
+  [![Runtime Security](https://img.shields.io/badge/runtime-security-0369A1)](#)
+  [![eBPF](https://img.shields.io/badge/telemetry-eBPF-0891B2)](#)
+  [![Policy](https://img.shields.io/badge/policy-natural_language-F59E0B)](#)
+  [![Status](https://img.shields.io/badge/status-active_development-2563EB)](#)
+
+  [Live Security Intelligence](https://www.chuhaijian.com/agentsec/) ·
+  [Architecture](docs/ARCHITECTURE.md) ·
+  [Natural-Language Policy](docs/NATURAL-LANGUAGE-POLICY.md)
+</div>
+
+---
 
 把 Linux 主机上的高权限 Agent，变成一条可以看见、搜索和追溯的证据链。
 
