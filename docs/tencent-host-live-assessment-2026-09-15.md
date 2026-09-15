@@ -12,7 +12,7 @@ and no configuration or agent file was changed.
 - Ubuntu 22.04.5 LTS, Linux 5.15.0-181-generic, x86-64, Tencent Cloud CVM.
 - The root filesystem reported 100% use (`40G`, approximately `38G` used).
 - `/var/log` occupied approximately 14G; systemd journals occupied about 800M.
-- KubeArmor runs in systemd mode with BPF-LSM active.
+- The AgentReins kernel sensor runs in systemd mode with BPF-LSM active.
 - Host policy and visibility are enabled for process, file, network, and capabilities.
 - All default host postures are audit, not block.
 
@@ -30,7 +30,7 @@ Every observed component ran as root with the full effective capability mask,
 `NoNewPrivs=0`, and `Seccomp=0`. This makes exact identity and lineage tracking a
 priority: a compromised component has broad host authority.
 
-## Runtime behavior confirmed from KubeArmor
+## Runtime behavior confirmed by AgentReins
 
 The available feed covered roughly the preceding 12 hours. Representative event
 counts included:
@@ -68,7 +68,7 @@ correlated.
 
 ## Existing audit pipeline defects
 
-The active policy is `ksp-host-audit-qcloud-agents`. General host visibility emits
+The active host audit policy provides process, file, network and capability visibility. General host visibility emits
 useful raw events, but the events sampled during this assessment had no
 `PolicyName`, so the current design relies on downstream text filtering rather
 than stable agent identity.

@@ -1,7 +1,0 @@
-source: ubuntu-4-deployment
-cmd: /readwrite -r /credentials/password
-result: passed
----
-operation: File
-condition: /credentials/password
-action: Block

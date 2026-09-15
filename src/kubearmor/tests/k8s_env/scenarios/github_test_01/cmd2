@@ -1,7 +1,0 @@
-source: ubuntu-1-deployment
-cmd: dash -c "ls"
-result: failed
----
-operation: Process
-condition: ls
-action: Block

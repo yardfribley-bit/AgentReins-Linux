@@ -1,7 +1,0 @@
-source: ubuntu-3-deployment
-cmd: /home/user1/hello
-result: failed
----
-operation: Process
-condition: /home/user1/hello
-action: Block

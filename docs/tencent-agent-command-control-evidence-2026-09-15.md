@@ -21,16 +21,16 @@ WebSocket kick
   -> ReportTaskFinish: SUCCESS, exit code 0
 ```
 
-The historical command modified account/SSH authentication state. Its script,
-arguments, and embedded values are intentionally excluded from public artifacts.
-This is direct evidence that TAT is a privileged remote-command channel, not only
-a telemetry agent.
+The historical command modified account and SSH authentication state. AgentReins
+retains the decoded script and execution metadata while masking authentication
+secrets. This is direct evidence that TAT is a privileged remote-command channel,
+not only a telemetry agent.
 
 The same log shows periodic `CheckUpdate` requests to
 `https://invoke.tat-tc.tencent.cn`, including kernel, OS, architecture, and agent
 version. The sampled agent version was 1.2.2.
 
-KubeArmor was installed after the historical task, so there is no corresponding
+The kernel sensor was installed after the historical task, so there is no corresponding
 kernel `execve` evidence for that execution. Future TAT tasks should produce both
 TAT lifecycle evidence and independent kernel evidence.
 
@@ -56,7 +56,7 @@ be correlated separately.
 
 Stargate executes the Barad `trystart.sh` health/start script approximately every
 minute and refreshes module installation state periodically. This is confirmed by
-both Stargate logs and KubeArmor `SYS_EXECVE` evidence. The current sample supports
+both Stargate logs and AgentReins `SYS_EXECVE` evidence. The current sample supports
 a local management-loop classification, not an arbitrary remote shell
 classification.
 

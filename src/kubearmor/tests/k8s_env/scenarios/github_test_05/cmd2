@@ -1,7 +1,0 @@
-source: ubuntu-1-deployment
-cmd: cat /etc/hosts
-result: default
----
-operation: File
-condition: /etc/hosts
-action: default

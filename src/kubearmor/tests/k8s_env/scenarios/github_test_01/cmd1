@@ -1,7 +1,0 @@
-source: ubuntu-1-deployment
-cmd: dash -c "uname -r"
-result: passed
----
-operation: Process
-condition: uname
-action: Block

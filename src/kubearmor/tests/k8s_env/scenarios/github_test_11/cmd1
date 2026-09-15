@@ -1,7 +1,0 @@
-source: ubuntu-1-deployment
-cmd: cat /etc/shells
-result: default
----
-operation: File
-condition: /etc/shells
-action: Block

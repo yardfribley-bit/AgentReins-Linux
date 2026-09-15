@@ -3,7 +3,7 @@
 ## Safety boundary
 
 The first production-host phase is read-only and audit-only. It must not apply a
-blocking KubeArmor policy, restart a Tencent service, modify an agent file, or
+blocking host policy, restart a Tencent service, modify an agent file, or
 intercept TLS traffic.
 
 ## Questions to answer
@@ -24,12 +24,12 @@ For each Tencent Cloud agent:
 
 Run `scripts/discover-tencent-agents.sh` and preserve its stdout locally. This
 establishes process, service, package, executable, privilege, descriptor, socket,
-and KubeArmor identities without changing the host.
+and kernel sensor identities without changing the host.
 
 ### Phase 1 — Runtime audit
 
 Enable host visibility for process, file, network, and capabilities. Consume the
-KubeArmor telemetry stream without applying blocking policies. Correlate events
+kernel telemetry stream without applying blocking policies. Correlate events
 by executable identity, PID lineage, cgroup, service, and timestamp.
 
 ### Phase 2 — Reporting analysis

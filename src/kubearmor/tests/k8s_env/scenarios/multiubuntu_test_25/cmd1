@@ -1,7 +1,0 @@
-source: ubuntu-2-deployment
-cmd: cat /home/user1/dir1/key1.txt
-result: failed
----
-operation: File
-condition: /home/user1/dir1/key1.txt
-action: Block

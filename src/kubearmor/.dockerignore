@@ -1,3 +1,0 @@
-# These object files are compiled at runtime in init container
-**/BPF/*.o
-Dockerfile

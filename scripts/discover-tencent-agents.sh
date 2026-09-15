@@ -89,7 +89,7 @@ else
     printf 'UNAVAILABLE: ss\n'
 fi
 
-section "KUBEARMOR STATUS"
+section "AGENTREINS KERNEL SENSOR STATUS"
 ps -eo user=,pid=,ppid=,args= 2>/dev/null | grep -Ei '[k]ubearmor' || true
 run_if_available karmor probe
 

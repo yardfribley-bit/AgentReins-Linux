@@ -37,7 +37,7 @@ def emit(event):
     try: events.put(event, timeout=1)
     except queue.Full: pass
 
-def kubearmor_stream():
+def kernel_stream():
     cmd = ["journalctl", "-u", "agentz-kubearmor-feed.service", "-f", "-n", "0", "-o", "cat"]
     while True:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1)
@@ -139,6 +139,6 @@ def send_loop():
                 if response.status == 202: pending.clear()
         except Exception: time.sleep(5)
 
-for target in (kubearmor_stream, tat_stream, agentsight_stream, send_loop):
+for target in (kernel_stream, tat_stream, agentsight_stream, send_loop):
     threading.Thread(target=target, daemon=True).start()
 while True: time.sleep(3600)

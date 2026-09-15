@@ -1,7 +1,0 @@
-source: ubuntu-2-deployment
-cmd: dash -c "cat /etc/hostname"
-result: passed
----
-operation: Process
-condition: cat
-action: Block

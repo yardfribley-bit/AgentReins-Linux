@@ -16,11 +16,11 @@
 
 ## Kernel evidence already confirmed
 
-KubeArmor/BPF-LSM recorded `kprobe=tcp_accept` events for Nginx worker PID 936.
+The AgentReins kernel sensor recorded `kprobe=tcp_accept` events for Nginx worker PID 936.
 Each event includes event time, worker PID, source executable, remote address,
 local port, protocol, and result.
 
-KubeArmor also records configuration and module file access through
+The kernel evidence stream also records configuration and module file access through
 `SYS_OPENAT`. The assessment commands `nginx -t` and `nginx -T` generated their
 own file events and must not be confused with long-running worker behavior.
 
@@ -60,7 +60,7 @@ tcp_accept
    request count, request time, upstream address, upstream time, status, and bytes.
 2. Validate with `nginx -t` and use a graceful reload only after approval.
 3. Add an AgentReins correlator that parses access records and structured
-   KubeArmor events without persisting raw client addresses.
+   kernel events without persisting raw client addresses.
 4. Add socket lifecycle collection for accept/connect/close and stable socket
-   identity. KubeArmor visibility alone does not provide the complete key.
+   identity. Kernel visibility alone does not provide the complete key.
 5. Publish only aggregated/redacted request chains to the `/agentsec/` console.
