@@ -18,11 +18,14 @@ The language model is never the enforcement authority. It may help normalize an
 open-ended request in a future compiler, but the resulting IR must pass the same
 deterministic schema, validation, capability, approval, and audit stages.
 
-## Initial TAT policy
+## Initial agent policy
 
-The first target is Tencent Cloud `tat_agent`. The initial vocabulary recognizes
-command execution, file reads and writes, network connections, credential access,
-approval requirements, and TLS plaintext evidence.
+The compiler is target-agnostic: whatever executable or agent name appears in the
+intent becomes the policy scope (for example `pentagi`, a container runtime, or any
+privileged host daemon). When no name is given the scope falls back to `agent`.
+
+The initial vocabulary recognizes command execution, file reads and writes, network
+connections, credential access, approval requirements, and TLS plaintext evidence.
 
 Blocking is intentionally not wired to the live host in v1alpha1. The control
 plane must first demonstrate stable compilation, explicit operator approval,

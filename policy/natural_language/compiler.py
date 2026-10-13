@@ -18,7 +18,7 @@ class NaturalLanguageCompiler:
     def compile(self, text: str, *, mode: str = "observe") -> Policy:
         normalized = " ".join(text.strip().split())
         match = self._agent.search(normalized)
-        executable = match.group(1) if match else "tat_agent"
+        executable = match.group(1) if match else "agent"
         rules: list[Rule] = []
 
         if self._has(normalized, "命令", "shell", "command", "执行"):

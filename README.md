@@ -22,13 +22,12 @@
 
 AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络传播、权限使用与执行结果。它不只告诉你“某个 Agent 建立了连接”，而是回答：谁下发了什么、哪个进程执行、触碰了哪些资源、向哪里传播，以及最终返回了什么。
 
-[查看在线实战：Tencent Cloud Agent 全过程](https://www.chuhaijian.com/agentsec/)
-
 ## 核心能力
 
 - **控制链还原**：关联控制消息、任务 ID、完整命令、执行身份、工作目录、PID 和退出结果。
 - **内核行为解析**：记录进程、文件、网络与 capability 事件，并保留原始证据。
-- **加密流量可见性**：在应用加密边界捕获 TLS 明文，区分收到的指令与发出的上报。
+- **容器归属**：把宿主 PID 命名空间中的进程回填到具体容器与镜像，沙箱行为不需要在容器内安装任何东西。
+- **外网访问审计**：按连接粒度记录出口目标与归属进程，区分授权靶标、内网与对外出网。
 - **跨层关联**：通过时间、PID、父子关系、连接和任务 ID，把控制面、用户态与内核态串成一条链。
 - **持续追溯**：增量采集、去重、持久化并支持按组件或任务回看。
 - **秘密保护**：命令与协议内容保持原貌，仅遮盖密码、Token、Cookie、私钥等认证秘密。
@@ -38,18 +37,56 @@ AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络
 
 ```text
 控制面消息
-  → TLS 明文请求/响应
   → 任务或策略身份
   → 本地进程及子进程
-  → 文件 / 网络 / 权限行为
+  → 容器归属与文件 / 网络行为
+  → 出口连接与分类
   → 结果与上报
 ```
 
-每条事件包含发生时间、组件、进程、PID/PPID、操作、资源、结果、证据来源和原始记录。关联结论区分“已确认”“跨层关联”和“当前未知”，不使用猜测填补证据空白。
+每条事件包含发生时间、组件、进程、PID/PPID、容器 ID、操作、资源、结果、证据来源和原始记录。关联结论区分“已确认”“跨层关联”和“当前未知”，不使用猜测填补证据空白。
 
 ## 当前实战
 
-项目已在腾讯云 CVM 上持续观测 TAT、Stargate、云镜和 Barad 等高权限组件。在线控制台已经还原真实 TAT 任务的完整生命周期：任务唤醒、拉取、脚本解码、root 执行、主机状态修改以及结果回报。
+项目在 PentAGI 所在的 Linux 宿主上持续观测这个高权限 Agent 的运行时行为：容器沙箱的创建与销毁、沙箱内外执行的命令与退出码、Agent 数据目录的文件访问，以及每一次对外连接的目标与归属进程。观测全部在宿主完成，不需要进入容器，也不依赖 eBPF。
+
+历史案例（早期在公有云主机上观测的高权限组件）保留在 `docs/legacy/`，仅作证据存档，不再维护。
+
+## 两种观测模式
+
+```text
+collector/agentreins_host_stream.py     宿主侧：盯一个高权限 Agent（默认 pentagi）
+collector/agentreins_pentest_stream.py  靶机侧：盯被攻击的应用（HTTP 请求 + 命令注入子进程）
+```
+
+宿主模式采集四个面：
+
+| 证据面 | 来源 | 能回答什么 |
+|---|---|---|
+| 控制面 | 容器运行时 events API | Agent 起停了哪些沙箱容器、用的什么镜像 |
+| 内核态进程 | netlink proc connector | 谁 fork/exec 了什么命令、退出码是多少 |
+| 容器归属 | `/proc/<pid>/cgroup` + cgroup.procs 快照 | 这个进程属于哪个容器（含短命令竞态兜底） |
+| 文件 | inotify | Agent 数据目录被谁读写 |
+| 外网访问 | netfilter LOG + socket inode→pid | 连去了哪里、哪个进程发起、是否授权靶标 |
+
+## 快速开始
+
+```bash
+sudo mkdir -p /opt/agentreins /var/log/agentreins
+sudo cp collector/agentreins_host_stream.py /opt/agentreins/
+sudo cp deploy/agentreins-host-stream.service /etc/systemd/system/
+
+# 外网访问审计（只记录，不阻断）
+sudo iptables -I OUTPUT  -m conntrack --ctstate NEW -m limit --limit 60/min \
+     -j LOG --log-prefix "AGENTREINS_EGRESS " --log-level 4
+sudo iptables -I FORWARD -s 172.16.0.0/12 -m conntrack --ctstate NEW -m limit --limit 60/min \
+     -j LOG --log-prefix "AGENTREINS_EGRESS " --log-level 4
+
+sudo systemctl enable --now agentreins-host-stream
+sudo tail -f /var/log/agentreins/host.jsonl
+```
+
+事件以 JSONL 落盘，同时打印到 stdout（journald）。配置 `AGENTREINS_INGEST_URL` 与 token 文件即可推送到上游。
 
 ## 代码结构
 
@@ -57,8 +94,7 @@ AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络
 collector/   实时事件采集、标准化、秘密遮盖与推送
 policy/      自然语言编译、Policy IR、AgentSpec 兼容与策略验证
 deploy/      主机服务和持续运行配置
-docs/        证据报告、架构与调查方法
-scripts/     组件发现及主机检查工具
+docs/        架构、调查方法与历史证据存档
 config/      策略和产品配置
 tests/       自动化验证
 ```
@@ -75,7 +111,7 @@ tests/       自动化验证
 
 ```bash
 PYTHONPATH=. python3 -m policy.cli \
-  "监控 tat_agent 执行的全部命令；修改系统文件时需要确认；读取凭据时阻止" \
+  "监控 pentagi 执行的全部命令；修改系统文件时需要确认；读取凭据时阻止" \
   --mode enforce --format json
 ```
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=AgentReins host agent observation stream
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/agentreins/agentreins_host_stream.py --agent pentagi --watch /opt/pentagi/data --targets 165.154.254.180
+Environment=AGENTREINS_OUT=/var/log/agentreins/host.jsonl
+Environment=AGENTREINS_LOG_PREFIX=AGENTREINS_EGRESS
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
