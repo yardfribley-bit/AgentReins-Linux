@@ -1,0 +1,9 @@
+-a always,exit -F arch=b64 -S execve,execveat -k agentreins_exec
+-a always,exit -F arch=b32 -S execve,execveat -k agentreins_exec
+-a always,exit -F arch=b64 -S connect,sendto -k agentreins_network
+-a always,exit -F arch=b32 -S connect,sendto -k agentreins_network
+-a always,exit -F arch=b64 -S unshare,setns,mount,umount2,pivot_root,chroot,capset,ptrace,setuid,setgid,setresuid,setresgid,seccomp,bpf -k agentreins_sandbox
+-w /etc/passwd -p wa -k agentreins_files
+-w /etc/group -p wa -k agentreins_files
+-w /etc/sudoers -p wa -k agentreins_files
+# Add watches for existing agent data directories on this host.

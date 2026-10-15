@@ -11,7 +11,9 @@
   [![Policy](https://img.shields.io/badge/policy-natural_language-F59E0B)](#)
   [![Status](https://img.shields.io/badge/status-active_development-2563EB)](#)
 
-  [Live Security Intelligence](https://www.chuhaijian.com/agentsec/) ·
+  [任务驾驶舱](https://www.agentreins.info/pentagi) ·
+  [观测控制台](https://www.agentreins.info/console) ·
+  [部署指南](docs/OBSERVABILITY-CONSOLE.md) ·
   [Architecture](docs/ARCHITECTURE.md) ·
   [Natural-Language Policy](docs/NATURAL-LANGUAGE-POLICY.md)
 </div>
@@ -21,6 +23,28 @@
 把 Linux 主机上的高权限 Agent，变成一条可以看见、搜索和追溯的证据链。
 
 AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络传播、权限使用与执行结果。它不只告诉你“某个 Agent 建立了连接”，而是回答：谁下发了什么、哪个进程执行、触碰了哪些资源、向哪里传播，以及最终返回了什么。
+
+## 在线体验
+
+- [PentAGI 任务驾驶舱](https://www.agentreins.info/pentagi)：按“目标输入 → 模型反馈 → 沙箱行动 → 执行结果 → 边界信号”阅读一次行动。
+- [通用观测控制台](https://www.agentreins.info/console)：搜索命令、容器、事件类型及时间范围，按需查看进程时间线。
+- 企业联系邮箱：[smithjat@agentreins.info](mailto:smithjat@agentreins.info)。
+
+## 本次更新：模型到命令的执行过程
+
+新增宿主统一采集、OpenAI 兼容模型网关、后端历史检索和独立驾驶舱。系统行为采集不读取 PentAGI 的业务数据库，接入其他智能体也不要求读取其数据库。
+
+| 层次 | 可观察内容 | 证据边界 |
+|---|---|---|
+| 模型交互 | 请求、响应、模型实际返回的推理字段、工具调用与后续回传 | 必须经过兼容网关；未返回的内部思考不可见 |
+| 命令执行 | Nmap、curl、dig、OpenSSL 等命令、PID、容器、退出事件 | 依赖采集器覆盖和进程归属；退出不等于任务成功 |
+| 容器与沙箱 | Docker 生命周期、容器内命令、选定隔离与权限系统调用 | 不是完整系统调用追踪或实时内核快照 |
+| 网络 | 选定 connect/sendto 与出口事件、进程候选关联 | 未采到事件不代表没有访问；不解密任意 HTTPS |
+| 历史回看 | 后端 SQLite 增量索引、筛选、分页、按需详情 | 这是 AgentReins 自己的证据索引，不是 Agent 业务库 |
+
+页面每 5 秒刷新一次，隐藏页面或编辑筛选条件时暂停轮询；非流式模型请求在完整响应返回后显示。工具调用与工具结果按调用 ID 关联；命令与模型的关系按命令文本、时间和进程树匹配，明确标注为候选，不能据此声称完整任务级追踪。
+
+已修复同一秒内执行记录与毫秒级模型事件无法关联、网络事件挤掉退出记录、工具调用没有普通文本时反馈为空等问题。部署文件和接口说明见 [观测平台部署指南](docs/OBSERVABILITY-CONSOLE.md)。
 
 ## 核心能力
 
@@ -48,7 +72,7 @@ AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络
 
 ## 当前实战
 
-项目在 PentAGI 所在的 Linux 宿主上持续观测这个高权限 Agent 的运行时行为：容器沙箱的创建与销毁、沙箱内外执行的命令与退出码、Agent 数据目录的文件访问，以及每一次对外连接的目标与归属进程。观测全部在宿主完成，不需要进入容器，也不依赖 eBPF。
+项目在 PentAGI 所在的 Linux 宿主上持续观测这个高权限 Agent 的运行时行为：容器沙箱的创建与销毁、沙箱内外执行的命令与退出码、Agent 数据目录的文件访问，以及采集覆盖范围内的对外连接和进程归属。系统事件观测在宿主完成；模型语义需要接入兼容网关。此部署不依赖 eBPF。
 
 历史案例（早期在公有云主机上观测的高权限组件）保留在 `docs/legacy/`，仅作证据存档，不再维护。
 
@@ -91,7 +115,8 @@ sudo tail -f /var/log/agentreins/host.jsonl
 ## 代码结构
 
 ```text
-collector/   实时事件采集、标准化、秘密遮盖与推送
+collector/   宿主采集、audit 桥、模型语义网关、标准化与推送
+console/     通用控制台、PentAGI 驾驶舱、历史索引与候选关联
 policy/      自然语言编译、Policy IR、AgentSpec 兼容与策略验证
 deploy/      主机服务和持续运行配置
 docs/        架构、调查方法与历史证据存档

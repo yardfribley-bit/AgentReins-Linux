@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/agentreins/agentreins_host_stream.py --agent pentagi --watch /opt/pentagi/data --targets 165.154.254.180
+ExecStart=/usr/bin/python3 /opt/agentreins/agentreins_host_stream.py --agent pentagi --watch /opt/pentagi/data
 Environment=AGENTREINS_OUT=/var/log/agentreins/host.jsonl
 Environment=AGENTREINS_LOG_PREFIX=AGENTREINS_EGRESS
 Restart=always

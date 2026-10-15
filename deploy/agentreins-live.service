@@ -1,0 +1,15 @@
+[Unit]
+Description=AgentReins observation console and cockpit
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/agentreins
+EnvironmentFile=-/etc/agentreins/console.env
+ExecStart=/usr/bin/python3 /opt/agentreins/generic_console.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

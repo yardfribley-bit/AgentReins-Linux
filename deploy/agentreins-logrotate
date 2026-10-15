@@ -1,0 +1,11 @@
+/var/log/agentreins/*.jsonl {
+    daily
+    maxsize 100M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
