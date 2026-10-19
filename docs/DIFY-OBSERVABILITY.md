@@ -28,7 +28,7 @@ JSONL 建议每 5–60 分钟检查 maxsize 100M，compress，rotate 7；配置�
 
 任务明细使用 allSettled，部分失败显示缺失提示；同步状态与历史列表独立加载；异步请求序号防止过时结果覆盖；移动端纵向排列；点击执行器打开命令、网络、内核及文件详情。
 
-Dify 代理建议关闭磁盘请求/响应缓冲并启用 JSON gzip，避免磁盘满导致大响应被截断。将 social.png 与 favicon.svg 配为静态资源；若使用内联脚本 SHA256 CSP，每次前端变更必须重新生成哈希。线上 nginx 配置及证书不含在此源码包中。
+Dify 代理建议关闭磁盘请求/响应缓冲并启用 JSON gzip，避免磁盘满导致大响应被截断。将 social.png、favicon.svg 与 favicon.ico 配为静态资源；同时覆盖 /favicon.ico 和 /dify/favicon.ico，示例见 deploy/nginx-dify-assets.conf.example。若使用内联脚本 SHA256 CSP，每次前端变更必须重新生成哈希。线上 nginx 配置及证书不含在此源码包中。
 
 ## 验证与限制
 

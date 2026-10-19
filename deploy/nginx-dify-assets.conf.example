@@ -1,0 +1,15 @@
+# Include these locations inside the HTTPS server serving /dify.
+# Install console/dify/{favicon.ico,favicon.svg,social.png} under /opt/agentreins-dify/.
+# Use exact locations so /dify/ API proxying does not return JSON 404 for assets.
+location = /favicon.ico {
+    alias /opt/agentreins-dify/favicon.ico;
+    types { }
+    default_type image/x-icon;
+}
+location = /dify/favicon.ico {
+    alias /opt/agentreins-dify/favicon.ico;
+    types { }
+    default_type image/x-icon;
+}
+location = /dify/favicon.svg { alias /opt/agentreins-dify/favicon.svg; }
+location = /dify/social.png { alias /opt/agentreins-dify/social.png; }
