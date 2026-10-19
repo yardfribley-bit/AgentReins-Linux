@@ -11,7 +11,7 @@ SEEN=collections.OrderedDict()
 LOCK=threading.Lock()
 STATUS={}
 OFFSETS={}
-PATHS=['/var/log/agentreins/host.jsonl','/var/log/agentreins/semantic.jsonl']
+PATHS=['/var/log/agentreins/host.jsonl','/var/log/agentreins/audit.jsonl','/var/log/agentreins/semantic.jsonl']
 def run(args):
  try:return subprocess.run(args,capture_output=True,text=True,timeout=4).stdout
  except Exception:return ''
@@ -98,9 +98,9 @@ async function processDetail(row){let box=document.getElementById('processDetail
 class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   path=self.path.split('?')[0]
-  if path=='/pentagi':
+  if path in ('/pentagi','/agents'):
    from pathlib import Path
-   body=Path(__file__).with_name('pentagi_cockpit.html').read_bytes();ctype='text/html; charset=utf-8'
+   body=Path(__file__).with_name('pentagi_cockpit.html').read_text().replace('PentAGI',os.environ.get('AGENTREINS_AGENT_LABEL','PentAGI')).replace('PENTAGI',os.environ.get('AGENTREINS_AGENT_LABEL','PENTAGI').upper()).replace('/pentagi','/agents').encode();ctype='text/html; charset=utf-8'
   elif path=='/api/cockpit':
    params=parse_qs(urlsplit(self.path).query)
    try:state=cockpit_data.detail(params) if params.get('id') else cockpit_data.summary(params)
@@ -117,7 +117,7 @@ class Handler(BaseHTTPRequestHandler):
   elif path=='/api/journeys':
    with LOCK:ev=list(EVENTS);sem=list(SEMANTICS)
    requested=parse_qs(urlsplit(self.path).query).get('id',[''])[0]
-   historical=history_store.association_events(sem) if requested else []
+   stored=history_store.semantic_events(); sem=list({r.get('eventKey') or str(r):r for r in stored+sem}.values()); historical=history_store.association_events(sem) if requested else []
    for row in historical:row['resource']=protect(row['resource']);row['process']=protect(row['process'])
    items=journeys(ev+historical,sem);requested=parse_qs(urlsplit(self.path).query).get('id',[''])[0]
    if requested:items=[j for j in items if j['id']==requested]

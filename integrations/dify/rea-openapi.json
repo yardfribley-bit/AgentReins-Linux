@@ -1,0 +1,131 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "AgentReins REA Frontend Analysis",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://172.18.0.1:18911"
+    }
+  ],
+  "paths": {
+    "/analyze": {
+      "post": {
+        "operationId": "rea_analyze_frontend",
+        "description": "Run REA static JavaScript analysis on the fixed AgentReins frontend snapshot. Returns runtime identity, evidence and a run_id. No arbitrary targets or shell commands.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Analysis evidence or saved report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/source": {
+      "post": {
+        "operationId": "read_frontend_source",
+        "description": "Read an exact source excerpt from the same snapshot, with file line and offset references. Adapter function, not REA analysis.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "symbol": {
+                    "type": "string",
+                    "enum": [
+                      "search",
+                      "searchView",
+                      "searchGuide",
+                      "get",
+                      "askAssistant",
+                      "render",
+                      "taskFiles",
+                      "selectTask",
+                      "bindFlight"
+                    ]
+                  }
+                },
+                "required": [
+                  "symbol"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Analysis evidence or saved report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/report": {
+      "post": {
+        "operationId": "save_rea_report",
+        "description": "Save the final Markdown investigation report for the REA run. Only writes a new report in the analysis output folder.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "run_id": {
+                    "type": "string"
+                  },
+                  "markdown": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "run_id",
+                  "markdown"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Analysis evidence or saved report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

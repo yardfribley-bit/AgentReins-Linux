@@ -1,8 +1,8 @@
-import glob,gzip,json,os,sqlite3,threading,time
+import glob,gzip,json,os,sqlite3,threading,time,datetime
 DB='/var/log/agentreins/history.sqlite3'
 STATUS={'state':'starting','indexed':0}
 def connect():
- c=sqlite3.connect(DB,timeout=30);c.execute('PRAGMA journal_mode=WAL');return c
+ c=sqlite3.connect(DB,timeout=30);c.execute('PRAGMA auto_vacuum=INCREMENTAL');c.execute('PRAGMA journal_mode=WAL');c.execute('PRAGMA max_page_count=524288');return c
 def init():
  c=connect();c.executescript('CREATE TABLE IF NOT EXISTS events (key TEXT PRIMARY KEY,time TEXT,category TEXT,operation TEXT,pid INTEGER,ppid INTEGER,container TEXT,process TEXT,resource TEXT,result TEXT,source TEXT,evidence TEXT);CREATE INDEX IF NOT EXISTS etime ON events(time);CREATE INDEX IF NOT EXISTS ec ON events(container,time);CREATE TABLE IF NOT EXISTS cursor(path TEXT PRIMARY KEY,inode INTEGER,offset INTEGER);');c.close()
 def ingest_file(path):
@@ -19,18 +19,31 @@ def ingest_file(path):
   except ValueError:continue
   ev=r.get('evidence') or {};key=r.get('eventKey')
   if not key:continue
+  try:
+   if datetime.datetime.fromisoformat(r.get('time','')).timestamp()<time.time()-72*3600:continue
+  except (ValueError,TypeError):continue
   c.execute('INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(key,r.get('time',''),r.get('category',''),r.get('operation',''),r.get('pid',0),r.get('ppid',ev.get('ppid',0)),r.get('containerId',''),r.get('process',''),r.get('resource',''),r.get('result',''),r.get('source',''),json.dumps(ev,ensure_ascii=False)))
   count+=1
-  if count%2000==0:c.commit();STATUS['indexed']+=2000
+  if count%2000==0:trim(c);c.commit();STATUS['indexed']+=2000
  c.execute('INSERT OR REPLACE INTO cursor VALUES(?,?,?)',(path,st.st_ino,0 if compressed else offset));c.commit();c.close();f.close();STATUS['indexed']+=count%2000
+
+def trim(c):
+ cutoff=datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=72)
+ c.execute('DELETE FROM events WHERE julianday(time)<julianday(?)',(cutoff.isoformat(),))
+ c.execute('DELETE FROM events WHERE rowid IN (SELECT rowid FROM events ORDER BY time DESC LIMIT -1 OFFSET 100000)')
+ used=(c.execute('PRAGMA page_count').fetchone()[0]-c.execute('PRAGMA freelist_count').fetchone()[0])*c.execute('PRAGMA page_size').fetchone()[0]
+ if used>1024**3:c.execute('DELETE FROM events WHERE rowid IN (SELECT rowid FROM events ORDER BY time ASC LIMIT 10000)')
+ c.commit();c.execute('PRAGMA incremental_vacuum(2000)')
+ STATUS.update(retentionHours=72,maxEvents=100000,softBytes=1024**3,hardBytes=2*1024**3)
 
 def loop():
  init()
  while True:
   STATUS['state']='indexing'
-  for path in sorted(glob.glob('/var/log/agentreins/host.jsonl*')):
+  for path in ['/var/log/agentreins/host.jsonl','/var/log/agentreins/audit.jsonl','/var/log/agentreins/semantic.jsonl']:
    try:ingest_file(path)
    except (OSError,sqlite3.Error) as e:STATUS['error']=type(e).__name__
+  c=connect();trim(c);c.close()
   STATUS['state']='ready';time.sleep(10)
 def start():threading.Thread(target=loop,daemon=True).start()
 def query(params):
@@ -68,7 +81,14 @@ def association_events(semantic):
    ev=json.loads(r[11] or '{}');row=dict(zip(['eventKey','time','category','operation','pid','ppid','containerId','process','resource','result','source'],r[:11]));row['kernelEvidence']={k:ev[k] for k in ('syscall','arch','exit','exit_code','exit_signal','uid','cwd','arguments','namespaces','cgroup') if k in ev};result.append(row)
   return result
  select='SELECT key,time,category,operation,pid,ppid,container,process,resource,result,source,evidence FROM events'
- for tool in build([],semantic)[:20]:
+ for tool in build([],semantic)[:40]:
+  try:
+   payload=json.JSONDecoder().raw_decode((tool.get('result') or {}).get('content',''))[0]
+   cid=payload.get('container_id','')
+  except (ValueError,TypeError,AttributeError):cid=''
+  if cid:
+   dt=datetime.datetime.fromisoformat(tool['time']);low=(dt-datetime.timedelta(seconds=5)).isoformat();high=(dt+datetime.timedelta(seconds=300)).isoformat()
+   for row in rows(select+' WHERE container=? AND time>=? AND time<=? LIMIT 2000',[cid[:12],low,high]):found[row['eventKey']]=row
   commands=[v for v in tool['commandIntent'] if len(v.strip())>=4]
   if not commands:continue
   dt=datetime.datetime.fromisoformat(tool['time']);low=(dt-datetime.timedelta(seconds=2)).isoformat();high=(dt+datetime.timedelta(seconds=300)).isoformat()
@@ -106,3 +126,9 @@ def process_timeline(params):
  for r in rows:
   row=dict(zip(columns,r[:10]));ev=json.loads(r[10] or '{}');row['state']={k:ev[k] for k in ('syscall','arch','exit','exit_code','exit_signal','uid','cwd','dst','dport','classification') if k in ev};result.append(row)
  c.close();return {'pid':pid,'containerId':container,'events':result,'association':'PID_CONTAINER_TIME_WINDOW','note':'按 PID、容器和选定时间附近检索，最多30分钟、500条。PID 复用或缺失容器归属时可能不完整；不是整个任务的全部行为。'}
+
+def semantic_events():
+ c=connect();rows=c.execute("SELECT key,time,category,operation,pid,ppid,container,process,resource,result,source,evidence FROM events WHERE category='semantic' AND operation IN ('MODEL_REQUEST','MODEL_RESPONSE','MODEL_ERROR','MODEL_REASONING','TOOL_CALL','TOOL_RESULT') ORDER BY time DESC LIMIT 2000").fetchall();c.close();out=[]
+ for r in reversed(rows):
+  row=dict(zip(['eventKey','time','category','operation','pid','ppid','containerId','process','resource','result','source'],r[:11]));ev=json.loads(r[11] or '{}');row.update(requestId=ev.get('requestId',''),identity='model-client:'+str(ev.get('peer','unknown')));out.append(row)
+ return out

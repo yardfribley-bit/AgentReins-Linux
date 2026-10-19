@@ -29,6 +29,14 @@ def build(events,semantic):
     for v in value:find(v)
   find(args)
   start=stamp(call['time']);window=[r for r in events if start-2<=stamp(r['time'])<=start+300 and r['category']!='semantic']
+  executor={}
+  try:
+   content=(call.get('result') or {}).get('content','')
+   if isinstance(content,str):executor=json.JSONDecoder().raw_decode(content)[0]
+   elif isinstance(content,dict):executor=content
+  except (ValueError,TypeError):pass
+  runtime_cid=executor.get('container_id','') if isinstance(executor,dict) else ''
+  direct=[r for r in events if runtime_cid and r.get('containerId') and (runtime_cid==r['containerId'] or runtime_cid.startswith(r['containerId'])) and start-5<=stamp(r['time'])<=start+300]
   matched=[]
   for row in window:
    if row['operation'] not in ('EXEC','AUDIT_EXEC'):continue
@@ -48,6 +56,8 @@ def build(events,semantic):
     if key not in seen:result.append(r);seen.add(key)
    return result[-100:]
   call.update(commandIntent=commands,commands=unique([r for r in linked if r['operation'] in ('EXEC','AUDIT_EXEC')]),network=unique([r for r in linked if r['category']=='network']),kernel=unique([r for r in linked if r['category'] in ('kernel','sandbox') and r['operation'] not in ('EXEC','AUDIT_EXEC')]),association='COMMAND_AND_TIME_CANDIDATE' if matched else 'NO_EXECUTION_LINK',associationNote='命令文本与时间窗口匹配，再关联进程后代；没有执行器传播的工具 ID，不能确认唯一归属。' if matched else '尚无可验证的命令关联。模型生成调用不等于工具已执行。',candidateCount=len(window))
+  if direct:
+   call.update(commands=unique([r for r in direct if r['operation'] in ('EXEC','AUDIT_EXEC')]),network=unique([r for r in direct if r['category']=='network']),kernel=unique([r for r in direct if r['category'] in ('kernel','sandbox') and r['operation'] not in ('EXEC','AUDIT_EXEC')]),association='EXECUTOR_CONTAINER_ID',associationNote='工具实际返回的运行时容器 ID 与内核 cgroup/容器证据一致；不是命令文本猜测。外部代理后续连接仍需单独关联。',traceId=executor.get('trace_id'),executionId=executor.get('run_id'),runtimeContainerId=runtime_cid,runtimeHostPid=executor.get('host_pid'))
   chains.append(call)
  return chains[::-1]
 
@@ -74,7 +84,7 @@ def journeys(events,semantic):
   text=json.dumps(group['request'],ensure_ascii=False).lower()
   group['isTest']=any(s in text for s in ('acceptance test','observability connectivity check','monitoring acceptance','monitoring verification'))
   group['model']=group['request'].get('model','unknown')
-  group['status']='模型已返回' if group['response'] else ('交互中断' if group['error'] else '等待模型响应')
+  group['status']=('模型错误响应' if group['response'].get('error') else '模型已返回') if group['response'] else ('交互中断' if group['error'] else '等待模型响应')
   group['previousInteractions']=list({t['requestId'] for key,t in tools.items() if key in group['previousTools']})
   result.append(group)
  return sorted(result,key=lambda r:r['time'],reverse=True)[:40]

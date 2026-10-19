@@ -22,6 +22,7 @@ Usage:
 """
 from __future__ import annotations
 
+from activity_policy import policy as persistence_policy
 import argparse
 import ctypes
 import hashlib
@@ -61,6 +62,8 @@ def event_key(event: dict) -> str:
 
 
 def emit(event: dict) -> None:
+    if not persistence_policy.keep(event):
+        return
     event["eventKey"] = event_key(event)
     try:
         events.put(event, timeout=1)
@@ -492,7 +495,7 @@ def sink_loop(cfg: argparse.Namespace) -> None:
                 continue
             seen.append(event["eventKey"])
             line = json.dumps(event, ensure_ascii=False)
-            print(line, flush=True)
+            # Canonical JSONL only; avoid a complete duplicate in journald.
             if handle:
                 handle.write(line + "\n")
                 handle.flush()

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Normalize Linux audit records into the existing AgentReins evidence stream."""
+from activity_policy import policy as persistence_policy
 import collections
 import datetime
 import hashlib
@@ -109,8 +110,10 @@ def emit(timestamp, serial, records):
     if operation == 'AUDIT_CONNECT' and call.get('exit') == '-115':
         event['result'] = 'CONNECT_PENDING'
     event['eventKey'] = hashlib.sha256(f'{timestamp}:{serial}:{operation}'.encode()).hexdigest()
+    if not persistence_policy.keep(event):
+        return
     line = (json.dumps(event, ensure_ascii=False)+'\n').encode()
-    for path in (OUT, '/var/log/agentreins/host.jsonl'):
+    for path in ('/var/log/agentreins/host.jsonl',):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.write(fd, line)

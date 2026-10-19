@@ -24,8 +24,15 @@
 
 AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络传播、权限使用与执行结果。它不只告诉你“某个 Agent 建立了连接”，而是回答：谁下发了什么、哪个进程执行、触碰了哪些资源、向哪里传播，以及最终返回了什么。
 
+## Dify 观测与容量治理更新（2026-10-19）
+
+新增 Dify 任务执行拓扑、组件详情弹窗、命令/内核/报告查看、字段与自然语言搜索，以及 REA 静态分析工具接入。历史索引保留最近 72 小时、最多 10 万条，设置 1 GiB 软限制和 2 GiB SQLite 页容量上限；删除过期记录会缩小可检索历史范围。空闲背景事件聚合，执行触发详细窗口；原始 Linux audit 不按任务关闭。
+
+代码来自实际部署版本，含环境相关路径，部署前请阅读 [Dify 部署与边界说明](docs/DIFY-OBSERVABILITY.md)。
+
 ## 在线体验
 
+- [Dify 执行观测](https://www.agentreins.info/dify)：按任务查看模型、工具、执行器、命令、内核和输出文件。
 - [PentAGI 任务驾驶舱](https://www.agentreins.info/pentagi)：按“目标输入 → 模型反馈 → 沙箱行动 → 执行结果 → 边界信号”阅读一次行动。
 - [通用观测控制台](https://www.agentreins.info/console)：搜索命令、容器、事件类型及时间范围，按需查看进程时间线。
 - 企业联系邮箱：[smithjat@agentreins.info](mailto:smithjat@agentreins.info)。
