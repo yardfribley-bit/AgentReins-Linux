@@ -28,7 +28,7 @@ class RuntimeTests(unittest.TestCase):
   with self.s.db() as c:self.s.prune(c);self.assertEqual(c.execute('SELECT count(*) FROM events').fetchone()[0],0)
   self.assertEqual(self.s.detail(aid)['evidence'][0]['id'],'e1')
  def test_no_cross_source_events(self):
-  with self.assertRaises(ValueError):self.s.ingest('host',[self.event(source='other')])
+  self.assertEqual(self.s.ingest('host',[self.event(source='other')]),0);self.assertEqual(len(self.s.last_ingest['host']['rejected']),1)
  def test_gate_denied_cannot_claim(self):
   g=self.gate();self.review(g,'deny')
   with self.assertRaises(Conflict):self.s.claim('host',g['id'],g['hash'])
@@ -67,7 +67,7 @@ class APITests(unittest.TestCase):
  def setUpClass(cls):
   cls.tmp=tempfile.TemporaryDirectory();cls.app=App(Path('runtime'),{'database':str(Path(cls.tmp.name)/'db'),'operatorToken':'test-op','sources':{'source':'test-source'}});cls.server=ThreadingHTTPServer(('127.0.0.1',0),cls.app.handler());cls.thread=threading.Thread(target=cls.server.serve_forever,daemon=True);cls.thread.start();cls.url='http://127.0.0.1:'+str(cls.server.server_port)+'/runtime/api/'
  @classmethod
- def tearDownClass(cls):cls.server.shutdown();cls.server.server_close();cls.tmp.cleanup()
+ def tearDownClass(cls):cls.app.stop.set();cls.server.shutdown();cls.server.server_close();cls.tmp.cleanup()
  def call(self,path,body=None,token=None):
   req=urllib.request.Request(self.url+path,data=json.dumps(body).encode() if body is not None else None,headers={'Content-Type':'application/json',**({'Authorization':'Bearer '+token} if token else {})})
   try:
@@ -76,5 +76,5 @@ class APITests(unittest.TestCase):
  def test_readonly_public_and_roles(self):
   self.assertEqual(self.call('alerts')[0],200);self.assertEqual(self.call('heartbeat',{},None)[0],403);self.assertEqual(self.call('heartbeat',{},'test-op')[0],404);self.assertEqual(self.call('alerts/nope/review',{'action':'allow'},'test-source')[0],403)
  def test_real_http_gate_flow(self):
-  self.call('heartbeat',{'layers':{'process':'active'}},'test-source');status,g=self.call('gates',{'requestKey':'http','tool':'runtime_lab_command','arguments':{'argv':['true']},'runId':'http','workload':'lab'},'test-source');self.assertEqual(status,201);a=self.call('alerts/'+g['alertId'])[1];self.assertEqual(self.call('alerts/'+a['id']+'/review',{'action':'allow','reason':'human approved','revision':a['revision']},'test-op')[0],200);self.assertEqual(self.call('gates/'+g['id']+'/claim',{'hash':g['hash']},'test-source')[0],200);self.assertEqual(self.call('gates/'+g['id']+'/claim',{'hash':g['hash']},'test-source')[0],409)
+  self.call('heartbeat',{'layers':{'process':'active'}},'test-source');status,g=self.call('gates',{'requestKey':'http','tool':'runtime_lab_command','arguments':{'argv':['true']},'runId':'http','workload':'lab'},'test-source');self.assertEqual(status,201);a=self.call('alerts/'+g['alertId'],token='test-op')[1];self.assertEqual(self.call('alerts/'+a['id']+'/review',{'action':'allow','reason':'human approved','revision':a['revision']},'test-op')[0],200);self.assertEqual(self.call('gates/'+g['id']+'/claim',{'hash':g['hash']},'test-source')[0],200);self.assertEqual(self.call('gates/'+g['id']+'/claim',{'hash':g['hash']},'test-source')[0],409)
 if __name__=='__main__':unittest.main()

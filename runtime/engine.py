@@ -1,5 +1,5 @@
 """Bounded persistent detection and approvals. No commands are executed here."""
-import contextlib,copy,hashlib,hmac,ipaddress,json,re,sqlite3,time,uuid
+import contextlib,copy,hashlib,hmac,ipaddress,json,re,sqlite3,time,uuid,fnmatch,shlex
 from pathlib import Path
 
 RULES=[
@@ -9,18 +9,20 @@ RULES=[
  {'id':'S04','version':'1.0','name':'下载文件后执行','severity':'high','sources':['process','network','file'],'condition':'同一工作负载内下载命令指定的落地路径，被后续进程执行','falsePositive':'合法安装/更新也会命中，必须审阅来源与任务','mode':'alert','limitation':'shell 启动本身不触发；下载/执行按路径与工作负载形成 candidate'},
  {'id':'S05','version':'1.0','name':'授权范围外连接','severity':'high','sources':['network'],'condition':'配置非空网络授权范围的工作负载连接未获允许的目的 IP/端口','falsePositive':'需包含 DNS、模型服务、CDN 与代理实际路径','mode':'alert','limitation':'未配置时不启用；连接尝试不等于已外传数据'},
  {'id':'P01','version':'1.0','name':'已接入工具执行前审批','severity':'medium','sources':['tool'],'condition':'受保护执行器即将执行一个具体调用','falsePositive':'审批请求不是危险行为已发生；这是显式工具保护策略','mode':'require_approval','limitation':'仅保护已接入的 REA analyze 与固定范围实验执行器，不覆盖任意 Dify 工具'}]
+for _rule in RULES:
+ if _rule['id']!='P01':_rule['version']='1.1'
 TERMINAL={'denied','expired','cancelled','succeeded','failed','interrupted'}
 def compact(v):return json.dumps(v,ensure_ascii=False,sort_keys=True,separators=(',',':'))
 def digest(v):return hashlib.sha256(compact(v).encode()).hexdigest()
 def clean(v):
- if isinstance(v,dict):return {str(k):('[REDACTED]' if re.search(r'(?i)^(authorization|api[_-]?key|password|token|secret|cookie|env)$',str(k)) else clean(x)) for k,x in v.items()}
+ if isinstance(v,dict):return {str(k):('[REDACTED]' if re.search(r'(?i)^(authorization|api[_-]?key|password|token|secret|cookie)$',str(k)) else clean(x)) for k,x in v.items()}
  if isinstance(v,list):return [clean(x) for x in v[:100]]
  if isinstance(v,str):return re.sub(r'(?i)(Bearer\s+|(?:password|api[_-]?key|token|secret)\s*[=:]\s*)[^\s"\']+',r'\1[REDACTED]',v[:16000])
  return v
 class Conflict(ValueError):pass
 class Store:
- def __init__(self,path,clock=time.time):
-  self.path=str(path);self.clock=clock;Path(path).parent.mkdir(parents=True,exist_ok=True)
+ def __init__(self,path,clock=time.time,config=None):
+  self.config=config or {};self.last_ingest={};self.path=str(path);self.clock=clock;Path(path).parent.mkdir(parents=True,exist_ok=True)
   with self.db() as c:
    c.executescript('''PRAGMA journal_mode=WAL; PRAGMA auto_vacuum=INCREMENTAL;
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, time REAL, source TEXT, workload TEXT, kind TEXT, payload TEXT);
@@ -37,14 +39,18 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
 ''')
    c.execute('PRAGMA max_page_count=65536')
  @contextlib.contextmanager
- def db(self):
+ def db(self,write=True):
   c=sqlite3.connect(self.path,timeout=15);c.row_factory=sqlite3.Row
   try:
-   c.execute('PRAGMA busy_timeout=15000');c.execute('PRAGMA max_page_count=65536');c.execute('BEGIN IMMEDIATE');yield c;c.commit()
+   c.execute('PRAGMA busy_timeout=15000')
+   if write:c.execute('PRAGMA max_page_count=65536');c.execute('BEGIN IMMEDIATE')
+   else:c.execute('PRAGMA query_only=ON');c.execute('BEGIN')
+   yield c;c.commit()
   except BaseException:c.rollback();raise
   finally:c.close()
  def heartbeat(self,source,body):
   now=self.clock();body=clean(body);body.update(source=source,receivedAt=now)
+  body['serverRejected']=self.last_ingest.get(source,{}).get('rejectedTotal',0)
   with self.db() as c:
    prev=c.execute('SELECT seen FROM sources WHERE id=?',(source,)).fetchone()
    if prev and now-prev['seen']>35:c.execute('INSERT OR REPLACE INTO gaps VALUES(?,?,?)',(source,prev['seen']+35,now))
@@ -54,7 +60,8 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
   if not row:return {'source':source,'state':'unknown','layers':{},'limitations':['未收到独立心跳']}
   body=json.loads(row['payload']);fresh=now-row['seen']<35;gaps=[dict(x) for x in c.execute('SELECT start,end FROM gaps WHERE source=? ORDER BY start DESC LIMIT 20',(source,))]
   if not fresh:gaps.insert(0,{'start':row['seen']+35,'end':None})
-  return {**body,'state':'online' if fresh else 'offline','ageSeconds':round(now-row['seen'],1),'gaps':gaps,'drop':body.get('drop'),'limitations':['未提供的 drop 计数为未知；心跳在线不证明每条事件已采到']}
+  counters=body.get('counters') or {};loss=sum(int(counters.get(k,0) or 0) for k in ('spoolDropped','expiredDropped','oversizeDropped','parseErrors','staleSkipped','rejectedEvents','rotationLost'));loss=max(loss,int(body.get('serverRejected',0)));audit=body.get('auditLost',body.get('drop'));degraded=bool(loss or (audit or 0)>0 or counters.get('backpressure',0))
+  return {**body,'state':('degraded' if degraded else 'online') if fresh else 'offline','auditLost':audit,'sensorLoss':loss,'degraded':degraded,'lossWarning':'检测窗口存在丢失、拒绝或积压，不能断言完整覆盖' if degraded else None,'ageSeconds':round(now-row['seen'],1),'gaps':gaps,'drop':(int(audit)+loss) if audit is not None else None,'limitations':['未提供的 drop 计数为未知；心跳在线不证明每条事件已采到']}
  def source_fresh(self,c,source):
   r=c.execute('SELECT seen FROM sources WHERE id=?',(source,)).fetchone();return r and self.clock()-r['seen']<35
  def _suppressed(self,c,e,rule):
@@ -65,24 +72,46 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
  def _alert(self,c,rule,e,refs,title,relation='explicit',basis='工作负载身份与直接主机事件',gate_id=None):
   spec=next(r for r in RULES if r['id']==rule)
   if self._suppressed(c,e,rule):return None
+  now=self.clock()
+  if not gate_id:
+   aggregate=digest([rule,e['source'],e['workload'],e.get('destination'),e.get('port'),e.get('path'),e.get('command') if rule in ('S03','S04') else None])
+   prior=c.execute('SELECT id,payload FROM alerts WHERE rule=? AND time>? ORDER BY time DESC LIMIT 200',(rule,now-300)).fetchall()
+   for old in prior:
+    existing=json.loads(old['payload'])
+    if existing.get('aggregateKey')==aggregate and e['id'] not in existing.get('sampleEventIds',[]):
+     existing['count']=existing.get('count',1)+1;existing['lastSeen']=max(existing.get('lastSeen',e['time']),e['time']);existing['revision']+=1;existing['sampleEventIds']=(existing.get('sampleEventIds',[])+[e['id']])[-1000:]
+     if len(existing['evidence'])<6:existing['evidence'].append(e)
+     c.execute('UPDATE alerts SET payload=? WHERE id=?',(compact(existing),old['id']));return old['id']
+    if existing.get('aggregateKey')==aggregate and e['id'] in existing.get('sampleEventIds',[]):return old['id']
+  else:aggregate=None
   key=digest([rule,e['source'],e['id'],gate_id]);aid='al_'+key[:24];coverage=self.coverage(c,e['source'])
-  value={'id':aid,'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'pending' if gate_id else 'open','revision':1,'source':e['source'],'workload':e['workload'],'runId':e.get('runId'),'gateId':gate_id,'relation':{'strength':relation,'basis':basis},'evidence':refs,'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
+  value={'id':aid,'aggregateKey':aggregate,'count':1,'firstSeen':e['time'],'lastSeen':e['time'],'sampleEventIds':[e['id']],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'pending' if gate_id else 'open','revision':1,'source':e['source'],'workload':e['workload'],'runId':e.get('runId'),'gateId':gate_id,'relation':{'strength':relation,'basis':basis},'evidence':refs,'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
   c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],value['status'],key,compact(value)));return aid
  def ingest(self,source,items):
+  if not isinstance(items,list):raise ValueError('events 必须为数组')
   if len(items)>100:raise ValueError('最多 100 条事件')
   now=self.clock();added=0
   with self.db() as c:
-   for item in sorted(items,key=lambda x:float(x.get('time',now))):
-    e=clean(item)
-    if e.get('source') not in (None,source):raise ValueError('来源不匹配')
-    if not e.get('id') or len(str(e['id']))>160 or e.get('kind') not in ('process','file','network','tool','model'):raise ValueError('事件字段无效')
-    if not e.get('workload') or not e.get('identity',{}).get('basis'):raise ValueError('必须登记工作负载身份及依据')
-    e['source']=source;e['receivedAt']=now;e['time']=float(e.get('time',now))
-    if abs(e['time']-now)>300:raise ValueError('只接受最近 5 分钟事件；历史回填须独立标识')
+   rejected=[]
+   valid=[]
+   for index,item in enumerate(items):
+    try:
+     if not isinstance(item,dict):raise ValueError('事件必须为对象')
+     e=clean(item)
+     if e.get('source') not in (None,source):raise ValueError('来源不匹配')
+     if not e.get('id') or len(str(e['id']))>160 or e.get('kind') not in ('process','file','network','tool','model'):raise ValueError('事件字段无效')
+     if not e.get('workload') or not e.get('identity',{}).get('basis'):raise ValueError('必须登记工作负载身份及依据')
+     e['source']=source;e['receivedAt']=now;e['time']=float(e.get('time',now))
+     if abs(e['time']-now)>72*3600:raise ValueError('超出 72 小时事件留存窗口')
+     valid.append(e)
+    except (ValueError,TypeError,AttributeError):rejected.append({'index':index,'reason':'事件字段、身份或时间无效'})
+   for e in sorted(valid,key=lambda x:x['time']):
     if c.execute('INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?)',(e['id'],e['time'],source,e['workload'],e['kind'],compact(e))).rowcount:
      added+=1;self.detect(c,e)
+   previous=self.last_ingest.get(source,{}).get('rejectedTotal',0)
+   self.last_ingest[source]={'rejected':rejected,'rejectedTotal':previous+len(rejected),'acknowledged':len(items)}
    # Late audit records can arrive after their corresponding execution.
-   for item in items:
+   for item in valid:
     if item.get('downloadPath'):
      for rr in c.execute('SELECT payload FROM events WHERE source=? AND workload=? AND kind=? AND time BETWEEN ? AND ? ORDER BY time LIMIT 100',(source,item['workload'],'process',float(item.get('time',now)),float(item.get('time',now))+120)).fetchall():self.detect(c,json.loads(rr[0]))
    self.prune(c)
@@ -91,7 +120,7 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
   w=e['workload'];kind=e['kind'];now=e['time'];row=[e]
   recent=lambda kinds:[json.loads(x[0]) for x in c.execute('SELECT payload FROM events WHERE source=? AND workload=? AND time BETWEEN ? AND ? AND kind IN ('+','.join('?' for _ in kinds)+') ORDER BY time DESC LIMIT 100',(e['source'],w,now-120,now,*kinds))]
   path=e.get('path','');cmd=e.get('command','');policy=e.get('policy') or {};success=e.get('result')
-  if kind=='file' and e.get('pid',0)>0 and e.get('access') in ('read_open','read') and re.search(r'(^|/)(\.env(?:\.[^/]*)?|\.ssh/[^/]+|credentials|[^/]+\.pem)$',path):
+  if kind=='file' and e.get('pid',0)>0 and e.get('access') in ('read_open','read') and sensitive_path(path,self.config.get('sensitivePaths')):
    self._alert(c,'S01',e,row,('敏感路径访问被拒绝：' if success=='denied' else '敏感路径读取权限访问：')+path)
   if kind=='network' and e.get('destination'):
    allowed=policy.get('allowedNetworks');enabled=isinstance(allowed,list) and len(allowed)>0
@@ -100,16 +129,16 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
     for t in recent(['tool']):
      if e.get('runId') and e.get('runId')==t.get('runId'):
       self._alert(c,'S02',e,[t,e],'工具后的非白名单外联','candidate','相同已登记任务身份与时间窗口；不代表工具唯一导致');break
-  if kind=='process' and e.get('result')=='success':
+  if kind=='process' and e.get('result') in ('success','attempt'):
    # Joining requires a concrete downloaded output path, not just starting a shell.
    for d in recent(['process']):
     if d['id']==e['id']:continue
     output=d.get('downloadPath')
-    if output and not e.get('downloadPath') and output in e.get('execPaths',[]) and d.get('destination') and d.get('result')=='success' and (not e.get('runId') or e.get('runId')==d.get('runId')):
+    if output and not e.get('downloadPath') and output in e.get('execPaths',[]) and d.get('destination') and d.get('result') in ('success','attempt') and (not e.get('runId') or e.get('runId')==d.get('runId')):
      self._alert(c,'S04',e,[d,e],'下载文件后执行：'+output,'candidate','相同工作负载、下载输出路径与执行参数匹配');break
-   if re.search(r'curl\s.*\|\s*(?:ba)?sh|rm\s+-rf|/dev/tcp/',cmd):
+   if risky_command(cmd):
     for m in recent(['model']):
-     if e.get('runId') and e.get('runId')==m.get('runId') and cmd and cmd in m.get('text',''):
+     if e.get('runId') and e.get('runId')==m.get('runId') and cmd and canonical_command(cmd) in canonical_command(m.get('text','')):
       self._alert(c,'S03',e,[m,e],'可疑模型到命令执行链','candidate','任务身份、命令文本与时间窗；不证明提示注入');break
  def prune(self,c):
   now=self.clock()
@@ -134,7 +163,9 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
  def gate_create(self,source,body):
   for k in ('requestKey','workload','tool','arguments','runId'):
    if k not in body:raise ValueError('缺少 '+k)
-  binding={k:body[k] for k in ('tool','arguments','runId','workload')};hash_=digest(binding);now=self.clock()
+  binding={k:body[k] for k in ('tool','arguments','runId','workload')}
+  if clean(binding)!=binding:raise ValueError('参数含需隐藏的凭据字段，禁止盲批；请用预配置凭据引用')
+  hash_=digest(binding);now=self.clock()
   with self.db() as c:
    self.expire(c)
    if body['tool'] not in ('rea_analyze_frontend','runtime_lab_command'):raise ValueError('此工具未接入执行审批')
@@ -144,7 +175,7 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
     if g['hash']!=hash_:raise Conflict('同一请求参数已改变，必须创建新审批')
     return g
    if not self.source_fresh(c,source):raise Conflict('来源心跳过期，拒绝创建执行许可')
-   if c.execute('SELECT count(*) FROM gates WHERE status IN (?,?)',('pending','approved')).fetchone()[0]>=30:raise Conflict('待审批队列已满')
+   if c.execute('SELECT count(*) FROM gates WHERE source=? AND status IN (?,?)',(source,'pending','approved')).fetchone()[0]>=30:raise Conflict('待审批队列已满')
    gid='gate_'+uuid.uuid4().hex;event={'id':gid+':intent','source':source,'workload':body['workload'],'kind':'tool','time':now,'runId':body['runId'],'operation':'EXECUTION_INTENT','tool':body['tool'],'arguments':clean(body['arguments']),'bindingHash':hash_,'identity':{'basis':'执行器在实际调用边界申请；不是已执行证据'}}
    aid=self._alert(c,'P01',event,[event],'工具执行前审批：'+str(body['tool']),'explicit','已接入执行器的具体调用绑定；并非下载或危险行为已发生',gid)
    g={'id':gid,'source':source,'createdAt':now,'deadline':now+min(120,max(10,int(body.get('timeout',90)))),'status':'pending','binding':clean(binding),'hash':hash_,'alertId':aid,'requestKey':body['requestKey']};c.execute('INSERT INTO gates VALUES(?,?,?,?,?,?,?)',(gid,source,hash_,source+':'+str(body['requestKey']),'pending',g['deadline'],compact(g)));return g
@@ -173,7 +204,8 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
   action=body.get('action');reason=body.get('reason','').strip()
   if action not in ('allow','deny','escalate','whitelist','dismiss','cancel') or not 3<=len(reason)<=1000:raise ValueError('请提供有效动作和至少三个字符的理由')
   with self.db() as c:
-   self.expire(c);r=c.execute('SELECT payload FROM alerts WHERE id=?',(aid,)).fetchone()
+   self.expire(c)
+   r=c.execute('SELECT payload FROM alerts WHERE id=?',(aid,)).fetchone()
    if not r:raise KeyError('告警不存在')
    a=json.loads(r[0]);revision=a['revision']
    if body.get('revision')!=revision:raise Conflict('证据或状态已更新，请刷新后重审')
@@ -199,15 +231,15 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
    a['revision']+=1;c.execute('UPDATE alerts SET status=?,payload=? WHERE id=?',(a['status'],compact(a),aid))
    v={'id':'rev_'+uuid.uuid4().hex,'time':self.clock(),'alertId':aid,'actor':actor,'action':action,'reason':reason,'snapshotRevision':revision,'evidenceHash':digest(a['evidence']),'result':a['status']};c.execute('INSERT INTO reviews VALUES(?,?,?,?)',(v['id'],v['time'],aid,compact(v)));return v
  def detail(self,aid):
-  with self.db() as c:
-   self.expire(c);r=c.execute('SELECT payload FROM alerts WHERE id=?',(aid,)).fetchone()
+  with self.db(write=False) as c:
+   r=c.execute('SELECT payload FROM alerts WHERE id=?',(aid,)).fetchone()
    if not r:raise KeyError('告警不存在')
    a=json.loads(r[0]);a['coverageNow']=self.coverage(c,a['source']);a['reviews']=[json.loads(x[0]) for x in c.execute('SELECT payload FROM reviews WHERE alert_id=? ORDER BY time',(aid,))]
    if a.get('gateId'):a['gate']=json.loads(c.execute('SELECT payload FROM gates WHERE id=?',(a['gateId'],)).fetchone()[0])
    return a
  def listing(self,q):
-  with self.db() as c:
-   self.expire(c);where=[];params=[]
+  with self.db(write=False) as c:
+   where=["status!='merged'"];params=[]
    for key in ('rule','severity','status'):
     v=q.get(key,[''])[0]
     if v:where.append(key+'=?');params.append(v)
@@ -216,13 +248,24 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
    sql=' WHERE '+' AND '.join(where) if where else '';total=c.execute('SELECT count(*) FROM alerts'+sql,params).fetchone()[0];offset=max(0,int(q.get('offset',['0'])[0]));limit=min(100,max(1,int(q.get('limit',['30'])[0])))
    items=[json.loads(r[0]) for r in c.execute('SELECT payload FROM alerts'+sql+' ORDER BY time DESC LIMIT ? OFFSET ?',(*params,limit,offset))]
    for a in items:a.pop('evidence',None);a.pop('ruleSnapshot',None)
-   stats={r['status']:r['n'] for r in c.execute('SELECT status,count(*) n FROM alerts GROUP BY status')};sources=[self.coverage(c,r[0]) for r in c.execute('SELECT id FROM sources')]
+   stats={r['status']:r['n'] for r in c.execute("SELECT status,count(*) n FROM alerts WHERE status!='merged' GROUP BY status")};sources=[self.coverage(c,r[0]) for r in c.execute('SELECT id FROM sources')]
    return {'items':items,'total':total,'offset':offset,'limit':limit,'stats':stats,'sources':sources,'serverTime':self.clock(),'capabilities':{'kernelBlock':False,'gate':'REA analyze + fixed-scope lab executor only','retention':'raw 72h/20000; alerts 30d/2000; 256MiB SQLite pages','webLens':'candidate import only; no automatic FOFA queries'}}
  def intelligence(self):
-  with self.db() as c:return [json.loads(x[0]) for x in c.execute('SELECT payload FROM intel ORDER BY time DESC LIMIT 50')]
+  with self.db(write=False) as c:return [json.loads(x[0]) for x in c.execute('SELECT payload FROM intel ORDER BY time DESC LIMIT 50')]
+ def intel_accept(self,iid,body,actor):
+  reason=str(body.get('reason','')).strip()
+  if len(reason)<3:raise ValueError('需要至少三个字符的审核理由')
+  with self.db() as c:
+   row=c.execute('SELECT payload FROM intel WHERE id=?',(iid,)).fetchone()
+   if not row:raise KeyError('候选不存在')
+   value=json.loads(row[0]);selected=body.get('rules',value.get('rules',[]))
+   if not selected or any(r not in [x['id'] for x in RULES if x['id']!='P01'] for r in selected):raise ValueError('请指定有效的行为规则')
+   value.update(status='accepted_recommendation',reviewedBy=actor,reviewedAt=self.clock(),reviewReason=reason,rules=selected,limitation='人工采纳的规则建议；不自动更改采集范围或启用阻断')
+   c.execute('UPDATE intel SET payload=? WHERE id=?',(compact(value),iid));return value
  def intel_import(self,body,actor):
   if not body.get('component') or not body.get('sourceUrl'):raise ValueError('需要组件与可追溯来源 URL')
-  v=clean({k:body.get(k) for k in ['component','version','sourceUrl','observedAt','assetId','note']});v.update(id='intel_'+uuid.uuid4().hex,receivedAt=self.clock(),actor=actor,status='candidate',rules=['S01','S03','S04'] if 'dify' in str(body['component']).lower() else ['S02','S05'],limitation='仅线索，不证明漏洞、不自动启用阻断')
+  component=str(body['component']).lower();mapping=self.config.get('intelligenceMappings',{'dify':{'rules':['S01','S03','S04'],'basis':'工作流执行与凭据访问风险，人工核查后决定'},'open webui':{'rules':['S01','S04'],'basis':'工具执行工作负载的通用文件/执行防护'}});match=mapping.get(component,{'rules':[],'basis':'没有匹配的映射，需人工制定'})
+  v=clean({k:body.get(k) for k in ['component','version','sourceUrl','observedAt','assetId','note']});v.update(id='intel_'+uuid.uuid4().hex,receivedAt=self.clock(),actor=actor,status='candidate',rules=match['rules'],mappingBasis=match['basis'],mappingVersion='1',limitation='仅线索，不证明漏洞、不自动启用阻断')
   with self.db() as c:c.execute('INSERT INTO intel VALUES(?,?,?)',(v['id'],self.clock(),compact(v)));c.execute('DELETE FROM intel WHERE rowid IN (SELECT rowid FROM intel ORDER BY time DESC LIMIT -1 OFFSET 50)')
   return v
 
@@ -235,3 +278,19 @@ def network_allowed(destination,port,allowed):
    if ip in ipaddress.ip_network(cidr,strict=False) and (ports is None or port in ports):return True
   except (ValueError,TypeError):continue
  return False
+
+SENSITIVE_PATHS={
+ 'env':['*/.env','*/.env.*'], 'ssh':['*/.ssh/*','*/id_rsa','*/id_ed25519','*/id_ecdsa'],
+ 'system':['/etc/shadow','/etc/gshadow'], 'kubernetes':['*/.kube/config','*/kubeconfig'],
+ 'container':['*/.docker/config.json'], 'git':['*/.git-credentials'], 'netrc':['*/.netrc'],
+ 'aws':['*/.aws/credentials','*/.aws/config'], 'gcloud':['*/.config/gcloud/application_default_credentials.json'],
+ 'azure':['*/.azure/accessTokens.json','*/.azure/msal_token_cache*'],
+ 'key':['*.pem','*.key'], 'secrets':['*/secrets.yaml','*/secrets.yml','*/secrets.json']}
+def sensitive_path(path,patterns=None):
+ groups=patterns if isinstance(patterns,dict) else SENSITIVE_PATHS
+ return any(fnmatch.fnmatchcase(path,p) for ps in groups.values() for p in ps)
+def canonical_command(s):
+ try:return ' '.join(shlex.split(s))
+ except ValueError:return ' '.join(s.split())
+def risky_command(cmd):
+ return bool(re.search(r'(?:curl|wget)\b.*\|\s*(?:/bin/)?(?:ba)?sh|\$\(\s*(?:curl|wget)\b|\bnc(?:at)?\b.*\s-e\s|rm\s+-rf|/dev/tcp/',cmd))
