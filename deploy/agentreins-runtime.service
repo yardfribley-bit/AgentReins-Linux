@@ -1,0 +1,19 @@
+[Unit]
+Description=AgentReins Runtime evidence alerts and execution approvals
+After=network-online.target
+[Service]
+User=agentreins-runtime
+Group=agentreins-runtime
+ExecStart=/usr/bin/python3 /opt/agentreins-runtime/server.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/agentreins-runtime
+MemoryMax=256M
+TasksMax=128
+[Install]
+WantedBy=multi-user.target

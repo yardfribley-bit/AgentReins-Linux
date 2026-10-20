@@ -1,0 +1,15 @@
+[Unit]
+Description=AgentReins Runtime host evidence adapter and independent heartbeat
+After=network-online.target agentreins-audit-bridge.service
+[Service]
+ExecStart=/usr/bin/python3 /opt/agentreins-runtime/sensor.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/agentreins-runtime
+MemoryMax=128M
+[Install]
+WantedBy=multi-user.target

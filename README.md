@@ -30,6 +30,10 @@ AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络
 
 代码来自实际部署版本，含环境相关路径，部署前请阅读 [Dify 部署与边界说明](docs/DIFY-OBSERVABILITY.md)。
 
+## Runtime 告警与审批首版
+
+新增 [Runtime 告警台](https://www.agentreins.info/runtime)，支持 S01/S04/S05 主机证据告警、独立覆盖心跳和持久人工审阅。REA analyze 接入单次执行前审批；公开只读，处置凭证独立。S02/S03 需要进一步贯通任务身份，主机阻断和自动 FOFA 联动未启用。范围、部署与验证见 [Runtime 说明](docs/RUNTIME.md)。
+
 ## 在线体验
 
 - [Dify 执行观测](https://www.agentreins.info/dify)：按任务查看模型、工具、执行器、命令、内核和输出文件。

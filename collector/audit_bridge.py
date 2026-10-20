@@ -103,9 +103,11 @@ def emit(timestamp, serial, records):
     elif key == 'agentreins_sandbox':
         category, operation = 'sandbox', 'AUDIT_BOUNDARY'
         extra['arguments'] = {k: call[k] for k in ('a0','a1','a2','a3') if k in call}
-    elif key == 'agentreins_files':
+    elif key in ('agentreins_files', 'agentreins_sensitive'):
         category, operation = 'kernel', 'AUDIT_FILE'
-        resource = ', '.join(decode(f.get('name','')) for t,f in records if t == 'PATH')
+        paths = [decode(f.get('name','')) for t,f in records if t == 'PATH' and decode(f.get('name','')) not in ('(null)', '')]
+        resource = ', '.join(paths)
+        extra.update(paths=paths, access='read_open' if key == 'agentreins_sensitive' else 'metadata_or_write', auditKey=key)
     event = {'time': datetime.datetime.fromtimestamp(float(timestamp)).astimezone().isoformat(), 'component': 'HostAudit', 'category': category, 'operation': operation, 'process': decode(call.get('exe','')), 'pid': pid, 'ppid': int(call.get('ppid','0')), 'containerId': ident.get('containerId',''), 'container': ident.get('containerId',''), 'resource': resource, 'data': json.dumps(extra, ensure_ascii=False), 'result': 'SUCCESS' if call.get('success') == 'yes' else 'FAILED_OR_PENDING', 'source': 'Linux audit subsystem', 'evidence': extra}
     if operation == 'AUDIT_CONNECT' and call.get('exit') == '-115':
         event['result'] = 'CONNECT_PENDING'

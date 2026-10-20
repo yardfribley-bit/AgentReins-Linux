@@ -1,5 +1,7 @@
 """Fixed-scope REA adapter for Dify; target is a public frontend snapshot only."""
-import datetime,hashlib,json,re,subprocess,threading,time,uuid
+import datetime,hashlib,json,re,subprocess,threading,time,uuid,sys
+sys.path.insert(0,"/opt/agentreins-runtime")
+from gate_client import Client,GateDenied
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 ROOT=Path('/home/smith/agentreins-rea');TARGET=ROOT/'target';RUNS=ROOT/'runs';RUNS.mkdir(exist_ok=True)
@@ -15,8 +17,13 @@ def analyze():
  rid=str(uuid.uuid4());trace=uuid.uuid4().hex;out=RUNS/rid;out.mkdir();name='dify-rea-'+rid[:8];started=time.time();cid='';pid=0
  args=['/runtime/bin/node','--max-old-space-size=1024',CLI,'analyze-javascript-application','/target','--source-path','frontend.js','--max-heap-mb','256','--analysis-timeout-ms','60000','--format','json']
  cmd=['docker','create','--name',name,'--network','none','--read-only','--cap-drop=ALL','--security-opt','no-new-privileges','--pids-limit','64','--memory','1536m','--cpus','1','--user','65534:65534','--tmpfs','/tmp:rw,nosuid,size=256m','-e','HOME=/tmp','-e','PATH=/runtime/bin:/usr/bin:/bin','--label','agentreins.workload=dify-rea','--label','agentreins.execution_id='+rid,'--label','agentreins.trace_id='+trace,'-v',str(NODE)+':/runtime:ro','-v',str(PACKAGE)+':/package:ro','-v',str(TARGET)+':/target:ro','--entrypoint',args[0],'vxcontrol/kali-linux:latest',*args[1:]]
- live(rid,'starting',traceId=trace,container=name)
+ live(rid,'awaiting_approval',traceId=trace,container=name)
+ gate=None
  try:
+  client=Client();target_hash=hashlib.sha256((TARGET/'index.html').read_bytes()).hexdigest()
+  gate=client.authorize('rea_analyze_frontend',{'argv':cmd,'target_sha256':target_hash},rid,workload='dify-rea',timeout=90,on_pending=lambda g:live(rid,'awaiting_approval',traceId=trace,gateId=g['id'],alertId=g['alertId'],deadline=g['deadline']))
+  if hashlib.sha256((TARGET/'index.html').read_bytes()).hexdigest()!=target_hash:raise GateDenied('目标快照已改变，必须重新审批')
+  live(rid,'starting',traceId=trace,container=name,gateId=gate['id'])
   cid=subprocess.check_output(cmd,text=True,timeout=30).strip();process=subprocess.Popen(['docker','start','-a',cid],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);time.sleep(.3);ins=json.loads(subprocess.check_output(['docker','inspect',cid],text=True))[0];pid=ins['State']['Pid'];command=' '.join(args);live(rid,'running',traceId=trace,container=name,containerId=cid,pid=pid,command=command)
   stdout,stderr=process.communicate(timeout=100);exitcode=json.loads(subprocess.check_output(['docker','inspect',cid],text=True))[0]['State']['ExitCode'];(out/'rea-evidence.json').write_text(stdout);(out/'stderr.txt').write_text(stderr)
   try:evidence=json.loads(stdout)
@@ -25,6 +32,9 @@ def analyze():
  except Exception as e:result={'run_id':rid,'trace_id':trace,'container_id':cid,'host_pid':pid,'exit_code':125,'error':type(e).__name__+': '+str(e)[:300]}
  finally:
   if cid:subprocess.run(['docker','rm','-f',cid],capture_output=True,timeout=30)
+ if gate:
+  try:client.complete(gate,result['exit_code'],executionId=rid,containerId=cid,pid=pid,traceId=trace)
+  except Exception:result['approval_reporting']='execution completed; result synchronization unavailable'
  (out/'report.json').write_text(json.dumps(result,ensure_ascii=False,indent=2));live(rid,'finished' if result['exit_code']==0 else 'failed',traceId=trace,container=name,containerId=cid,pid=pid,exitCode=result['exit_code'],files=result.get('files',[]),command=result.get('command'))
  return result
 SYMBOLS=['search','searchView','searchGuide','get','askAssistant','render','taskFiles','selectTask','bindFlight']
