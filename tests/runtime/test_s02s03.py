@@ -20,7 +20,7 @@ from runtime.command_parse import parse
 from runtime.engine import Store, clean, redact_text
 from runtime.redact import redact_text as redact_direct
 from runtime.semantic_extract import ChainBook, bound_event, extract_entities, untrusted_segments
-from runtime.sensor import Adapter, layer_status
+from runtime.sensor import Adapter, lab_workload, layer_status, service_state
 from runtime.watch_scope import apply
 from scripts.export_timeline import export_window, verify_jsonl, verify_sums
 from scripts.upperdir_changes import diff_snapshots, scan_upper
@@ -267,6 +267,25 @@ class ScenarioTests(Harness):
         self.assertEqual(alert['fileDigest']['after'], after)
         self.assertEqual(alert['ruleSnapshot']['mode'], 'alert')
         self.assertNotIn('block', alert['ruleSnapshot']['mode'])
+        later = hashlib.sha256(b'later').hexdigest()
+        self.ingest(self.host('write-2', 'target-01', 'file', path='/home/drill/.bashrc', access='write', sha256Before=after, sha256After=later, size=5))
+        updated = self.by_rule('S08')[0]
+        self.assertEqual(updated['count'], 2)
+        self.assertEqual(updated['fileDigest']['before'], after)
+        self.assertEqual(updated['fileDigest']['after'], later)
+
+    def test_audit_service_down_degrades_then_recovers(self):
+        self.store.heartbeat('host', {'drop': 0, 'serviceState': {'audit': 'active'}, 'layers': {'file': 'watched_paths_only', 'network': 'active'}})
+        with self.store.db(write=False) as cursor:
+            self.assertEqual(self.store.coverage(cursor, 'host')['state'], 'online')
+        self.store.heartbeat('host', {'drop': 0, 'serviceState': {'audit': 'inactive'}, 'layers': {'file': 'unavailable', 'network': 'unavailable'}})
+        with self.store.db(write=False) as cursor:
+            down = self.store.coverage(cursor, 'host')
+        self.assertEqual(down['state'], 'degraded')
+        self.assertEqual(down['layers']['file'], 'unavailable')
+        self.store.heartbeat('host', {'drop': 0, 'serviceState': {'audit': 'active'}, 'layers': {'file': 'watched_paths_only', 'network': 'active'}})
+        with self.store.db(write=False) as cursor:
+            self.assertEqual(self.store.coverage(cursor, 'host')['state'], 'online')
 
     def test_coverage_host_linked_and_per_source_cap(self):
         entities = {'urls': [], 'hosts': [], 'paths': [PATH], 'commands': []}
@@ -282,6 +301,27 @@ class ScenarioTests(Harness):
         capped.ingest('a', batch[100:])
         with capped.db(write=False) as cursor:
             self.assertLessEqual(cursor.execute('SELECT count(*) FROM events WHERE source=?', ('a',)).fetchone()[0], 100)
+
+
+class FanotifyRecordTests(unittest.TestCase):
+    def test_open_and_write_shapes(self):
+        import importlib.util
+        sys.path.insert(0, str(ROOT / 'collector'))
+        spec = importlib.util.spec_from_file_location('host_stream_fan', ROOT / 'collector' / 'agentreins_host_stream.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        opened = mod.fanotify_records('/tmp/drill/.env-canary', 40, mod.FAN_OPEN, ppid=7, cmdline='cat /tmp/drill/.env-canary')
+        self.assertEqual([item['operation'] for item in opened], ['AUDIT_FILE', 'EXEC'])
+        self.assertEqual(opened[0]['evidence']['access'], 'read_open')
+        self.assertEqual(opened[0]['evidence']['paths'], ['/tmp/drill/.env-canary'])
+        self.assertNotIn('PLACEHOLDERSECRET', json.dumps(opened))
+        written = mod.fanotify_records('/home/drill/.ssh/authorized_keys', 41, mod.FAN_CLOSE_WRITE, cmdline='')
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]['evidence']['access'], 'metadata_or_write')
+        self.assertEqual(mod.fanotify_records('', 1, mod.FAN_OPEN), [])
+        stamped = mod.now_iso()
+        self.assertIn('T', stamped)
+        self.assertRegex(stamped, r'\.\d{3}')
 
 
 class SensorWriteTests(unittest.TestCase):
@@ -301,6 +341,23 @@ class SensorWriteTests(unittest.TestCase):
         self.assertIn('192.0.2.0/24', json.dumps(event['policy']))
         quoted = __import__('shlex').join(['bash', '-c', 'curl https://example.test/a > /tmp/a'])
         self.assertEqual(parse(quoted, '/work').get('downloadPath'), '/tmp/a')
+
+    def test_lab_recent_pid_is_explicit(self):
+        record = {'pid': 10, 'startTicks': '99', 'recentPids': [42]}
+        self.assertTrue(lab_workload(42, 0, record, '99'))
+        self.assertTrue(lab_workload(11, 10, record, '99'))
+        self.assertFalse(lab_workload(42, 0, record, '100'))
+        self.assertFalse(lab_workload(7, 8, record, '99'))
+
+    def test_plain_process_counts_as_collector(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        proc = Path(tmp.name) / '99'
+        proc.mkdir()
+        (proc / 'cmdline').write_bytes(b'python3\x00/opt/agentreins/audit_bridge.py\x00')
+        self.assertEqual(service_state('agentreins-audit-bridge', proc_root=tmp.name), 'active')
+        (proc / 'cmdline').write_bytes(b'python3\x00/opt/agentreins-runtime/sensor.py\x00')
+        self.assertEqual(service_state('agentreins-audit-bridge', proc_root=tmp.name), 'inactive')
 
 
 class RedactTests(unittest.TestCase):
@@ -380,6 +437,11 @@ class ReplayTests(unittest.TestCase):
 
 
 class WatchTests(unittest.TestCase):
+    def test_apply_does_not_raise_when_auditctl_is_denied(self):
+        scope = apply({'watchCandidates': {'drill': ['/tmp/drill/.env-canary']}, 'persistCandidates': {'ssh': ['/home/drill/.ssh/authorized_keys']}}, True)
+        self.assertIn('fileWatchCategories', scope)
+        self.assertIn('persistWatchCategories', scope)
+
     def test_persist_preview_uses_existing_paths_only(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

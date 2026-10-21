@@ -18,7 +18,7 @@
 
 容器归属使用明确登记的容器名模式与容器 ID；主机父进程匹配包含启动时刻和 boot ID。短命进程可能无法获得 startTicks，此字段保持 null；父进程身份可以确认时展示依据，不能获取则不纳入保护对象。PID/cgroup 关联存在系统竞态，不承诺零漏采。
 
-独立每 10 秒心跳，35 秒过期；记录断连区间、audit lost、消费端过期/队列丢弃。文件覆盖仅限实际审计 watch。模型层为 not_connected / gateway_unbound / gateway_bound / linked：路由已加载但 5 分钟内没有语义事件时是 gateway_bound，有语义事件才是 linked。工具层为 rea_only / semantic_linked；若该来源在 5 分钟内有已主机确认的 S02/S03，覆盖视图标为 host_linked。心跳在线不等于全部事件都采到。
+独立每 10 秒心跳，35 秒过期；记录断连区间、audit lost、消费端过期/队列丢弃。文件覆盖仅限实际审计 watch。模型层为 not_connected / gateway_unbound / gateway_bound / linked：路由已加载但 5 分钟内没有语义事件时是 gateway_bound，有语义事件才是 linked。工具层为 rea_only / semantic_linked；若该来源在 5 分钟内有已主机确认的 S02/S03，覆盖视图标为 host_linked。心跳在线不等于全部事件都采到。采集器是否在跑，先看 systemd 单元，没有 systemd 时看进程命令行里是否有对应脚本；audit 桥为 inactive 或 failed 时，来源在心跳仍新鲜的情况下记为 degraded，桥恢复后的下一次心跳回到 online（近期损失窗口里已有的丢失仍会使 degraded 保持到窗口结束）。
 
 事件默认保留 72 小时/20000 条；演练可在 runtime 的 config.json 提高 `maxEvents`（1000–2000000）和 `maxEventsPerSource`（100–2000000）。这两项由 runtime 服务读取，写在 sensor.json 里不会生效。告警快照与审阅 30 天/最多约 2000 条非 pending 告警。单来源待审批总队列有界；SQLite 页硬限制 256MiB，不包含 WAL。应另配磁盘监控与 WAL checkpoint。待审批不自动丢弃；错误时不发许可。原始 host.jsonl 沿用既有轮转。
 
@@ -33,11 +33,11 @@ pending → approved → executing → succeeded/failed；或 pending → denied
 
 - 云端 `/opt/agentreins-runtime`：server.py、engine.py、index.html、style.css、app.js；服务独立低权限用户，loopback 18920。
 - `/etc/agentreins-runtime/config.json`：database、operatorToken、operatorName、sources `{sourceId:token}`，权限 640，服务组可读；不要提交凭证。
-- 源端 sensor.py、gate_client.py、lab.py，以及 agents_config.py、semantic_extract.py、chain_detect.py、redact.py。`/etc/agentreins-runtime/sensor.json` 权限 600：url、token、containerPatterns、policies、agentsFile；按需设置 proxies。样例见 `config/sensor.json.example`。
+- 源端 sensor.py、gate_client.py、lab.py，以及 agents_config.py、semantic_extract.py、chain_detect.py、redact.py。`/etc/agentreins-runtime/sensor.json` 权限 600：url、token、containerPatterns、policies、agentsFile；按需设置 proxies。样例见 `config/sensor.json.example`。采集器请求的是 `url + /api/heartbeat`，因此 url 写成 `http://127.0.0.1:18920/runtime`，不要再加一层 `/api`。
 - 语义网关读 `/etc/agentreins/agents.yaml`（`AGENTREINS_AGENTS`）。样例 `config/agents.yaml.example` 使用 RFC 5737 文档地址，部署时换成该主机的网桥网段，不要把真实地址提交回仓库。每个 agent 的模型 base URL 指向自己的网关端口，或指向带 `/a/<agentId>` 前缀的路径。`peerAllowlist` 为空表示放行，演练必须写上 plugin_daemon 或 PentAGI 容器所在网段。
 - runtime 留存写在 `/etc/agentreins-runtime/config.json`，样例 `config/runtime.config.json.example`。演练建议 `maxEvents` 200000、`maxEventsPerSource` 80000，并加大 audit backlog。主机之间对时。
 - `deploy/agentreins-runtime*.service` 和 nginx-runtime.conf.example 提供服务样例。网关、host-stream、audit-bridge 的单元把 `PYTHONPATH` 和 `AGENTREINS_RUNTIME` 指到 `/opt/agentreins-runtime`。
-- audit_bridge.py 归一化 agentreins_sensitive 读取，以及 agentreins_persist 写入。`python3 runtime/watch_scope.py --apply` 只为已经存在的路径安装 watch：读取 `-p r -k agentreins_sensitive`，写入 `-p wa -k agentreins_persist`。静态 `deploy/60-agentreins.rules` 不写入可能不存在的路径。不要全局审计所有 read，也不要打开内核阻断。
+- audit_bridge.py 归一化 agentreins_sensitive 读取，以及 agentreins_persist 写入。`python3 runtime/watch_scope.py --apply` 只为已经存在的路径安装 watch：读取 `-p r -k agentreins_sensitive`，写入 `-p wa -k agentreins_persist`。静态 `deploy/60-agentreins.rules` 不写入可能不存在的路径。不要全局审计所有 read，也不要打开内核阻断。若本机不能成为内核 audit 守护进程（外层已经占用 audit netlink，`auditctl` 返回 EPERM），可用 host-stream 的 `--fanotify` 对已经存在的文件做只读观察，事件仍进同一条 host.jsonl，不读取文件正文，也不阻断。这不是 audit 规则的替代品；能注册 auditd 的主机仍以 audit 为准。
 - REA 执行器依赖 gate_client.py 和 sensor.json，升级必须同时部署；一旦启用，REA analyze 每次需要审批，可能超过上游工具调用超时，请核对 Dify 配置。
 
 ## 验证
@@ -66,7 +66,7 @@ pending → approved → executing → succeeded/failed；或 pending → denied
 
 curl/wget 显式输出参数与远端默认文件名优先于 shell stdout 重定向，`curl -o /tmp/a URL > /dev/null` 不会改记为 /dev/null；`-o-` 明确输出 stdout，不当作落地文件。无输出选项的 curl 才使用 stdout 重定向作为路径。
 
-宿主 netlink EXEC 在捕获时尝试补采 `/proc/<pid>/cwd`，读前后核对进程启动时刻，失败保持 null；runtime 继续优先使用 audit 的 cwd。短命进程和并发 chdir 仍有竞态，缺失工作目录时不猜测相对路径。
+宿主 netlink EXEC 在捕获时尝试补采 `/proc/<pid>/cwd`，读前后核对进程启动时刻，失败保持 null；runtime 继续优先使用 audit 的 cwd。短命进程和并发 chdir 仍有竞态，缺失工作目录时不猜测相对路径。host-stream 写出的观察时间带到毫秒；只有整秒的时间会排在同一秒内更晚的工具调用之前，主机确认因此对不上。受控实验进程可以在 lab identity 里登记 `recentPids`，短命子进程退出后仍能按这个显式登记归属，而不是靠猜父进程。
 
 ## 演练准备：S02/S03、S08 与只读导出（2026-10-21）
 

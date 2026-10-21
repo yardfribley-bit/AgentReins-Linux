@@ -35,15 +35,24 @@ def _install(mapping,permission,key,existing,install):
  return result,lines
 def apply(config,install=False):
  mapping=config.get('watchCandidates',CANDIDATES);persist=config.get('persistCandidates',PERSIST)
- existing=subprocess.check_output(['auditctl','-l'],text=True) if install else ''
+ existing='';audit_error=None
+ if install:
+  try:existing=subprocess.check_output(['auditctl','-l'],text=True,stderr=subprocess.STDOUT)
+  except (OSError,subprocess.CalledProcessError) as exc:
+   audit_error=str(exc);install=False
  result,lines=_install(mapping,'r','agentreins_sensitive',existing,install)
  written,write_lines=_install(persist,'wa','agentreins_persist',existing,install)
  if install:
-  Path('/etc/audit/rules.d/61-agentreins-sensitive.rules').write_text('\n'.join(lines)+('\n' if lines else ''))
-  Path('/etc/audit/rules.d/62-agentreins-persist.rules').write_text('\n'.join(write_lines)+('\n' if write_lines else ''))
+  try:
+   Path('/etc/audit/rules.d/61-agentreins-sensitive.rules').write_text('\n'.join(lines)+('\n' if lines else ''))
+   Path('/etc/audit/rules.d/62-agentreins-persist.rules').write_text('\n'.join(write_lines)+('\n' if write_lines else ''))
+  except OSError as exc:
+   audit_error=(audit_error+'; ' if audit_error else '')+str(exc)
  scope=[x for paths in result.values() for x in paths]+[x for paths in written.values() for x in paths]
  missing=[k for k,v in {**result,**written}.items() if not v]
- return {'fileWatchCategories':result,'persistWatchCategories':written,'fileWatchScope':scope,'unwatchedCategories':missing}
+ out={'fileWatchCategories':result,'persistWatchCategories':written,'fileWatchScope':scope,'unwatchedCategories':missing}
+ if audit_error:out['auditApplyError']=audit_error
+ return out
 if __name__=='__main__':
  p=argparse.ArgumentParser();p.add_argument('--config',default='/etc/agentreins-runtime/sensor.json');p.add_argument('--apply',action='store_true');args=p.parse_args();file=Path(args.config);config=json.loads(file.read_text());scope=apply(config,args.apply)
  if args.apply:config.update(scope);file.write_text(json.dumps(config))

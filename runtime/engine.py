@@ -78,6 +78,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
   window=max(60,min(3600,int(self.config.get('lossWindowSeconds',900))))
   recent=c.execute('SELECT coalesce(sum(audit),0),coalesce(sum(sensor),0) FROM coverage_losses WHERE source=? AND time>?',(source,now-window)).fetchone()
   recent_audit,recent_sensor=recent[0],recent[1];degraded=bool(recent_audit or recent_sensor or counters.get('backpressure',0))
+  if (body.get('serviceState') or {}).get('audit') in ('inactive','failed'):degraded=True
   layers=self._overlay_layers(c,source,body.get('layers'))
   return {**body,'layers':layers,'state':('degraded' if degraded else 'online') if fresh else 'offline','auditLost':audit,'sensorLoss':loss,'degraded':degraded,'lossWindowSeconds':window,'recentLoss':{'audit':recent_audit if audit is not None else None,'sensor':recent_sensor,'total':recent_audit+recent_sensor if audit is not None else None},'historicalLoss':{'audit':audit,'sensor':loss},'lossWarning':'近期检测窗口有丢失、拒绝或背压' if degraded else None,'ageSeconds':round(now-row['seen'],1),'gaps':gaps,'drop':(int(audit)+loss) if audit is not None else None,'limitations':['近期未增长不代表历史没有缺口；累计损失单独展示','工作目录来自 audit 或执行时 /proc；短命进程可能无法补采','S02/S03 主机段只在同一 agent 的参数实体对齐后升级；Dify bridge 不是触发源']}
  def _overlay_layers(self,c,source,layers):
@@ -109,6 +110,12 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
     if existing.get('aggregateKey')==aggregate and e['id'] not in existing.get('sampleEventIds',[]):
      existing['count']=existing.get('count',1)+1;existing['lastSeen']=max(existing.get('lastSeen',e['time']),e['time']);existing['revision']+=1;existing['sampleEventIds']=(existing.get('sampleEventIds',[])+[e['id']])[-1000:]
      if len(existing['evidence'])<6:existing['evidence'].append(e)
+     if e.get('sha256Before') or e.get('sha256After'):
+      digest_info=dict(existing.get('fileDigest') or {})
+      if e.get('sha256Before'):digest_info['before']=e.get('sha256Before')
+      if e.get('sha256After'):digest_info['after']=e.get('sha256After')
+      if e.get('size') is not None:digest_info['size']=e.get('size')
+      existing['fileDigest']=digest_info
      c.execute('UPDATE alerts SET payload=? WHERE id=?',(compact(existing),old['id']));return old['id']
     if existing.get('aggregateKey')==aggregate and e['id'] in existing.get('sampleEventIds',[]):return old['id']
   else:aggregate=None

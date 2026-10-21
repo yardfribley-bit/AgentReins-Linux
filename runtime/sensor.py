@@ -11,6 +11,26 @@ except ImportError:from agents_config import load_agents, agent_for_container, s
 VERSION='runtime-1.3-s02s03'
 SEMANTIC_OPS={'MODEL_REQUEST','MODEL_RESPONSE','TOOL_CALL','TOOL_RESULT'}
 ENRICHMENT_ATTRIBUTION={'DIRECT_API_EVENT','DIRECT_API_STATE','EXECUTOR_RUNTIME_ID'}
+# Plain-process deploys have no systemd unit. Coverage still needs to see whether the collector is running.
+COLLECTOR_MARKERS={'agentreins-host-stream':'agentreins_host_stream.py','agentreins-audit-bridge':'audit_bridge.py','agentreins-semantic-gateway':'semantic_gateway.py'}
+def process_matches(marker, proc_root='/proc'):
+ root=Path(proc_root)
+ if not marker or not root.is_dir():return False
+ for entry in root.iterdir():
+  if not entry.name.isdigit():continue
+  try:raw=(entry/'cmdline').read_bytes()
+  except OSError:continue
+  if marker.encode() in raw.replace(b'\x00',b' '):return True
+ return False
+def service_state(name, proc_root='/proc'):
+ """active when systemd says so or the collector process is visible. inactive when this unit is known and absent."""
+ reported=''
+ try:reported=subprocess.run(['systemctl','is-active',name],capture_output=True,text=True,timeout=2).stdout.strip()
+ except Exception:reported=''
+ marker=COLLECTOR_MARKERS.get(name)
+ if marker and process_matches(marker, proc_root):return 'active'
+ if reported:return reported
+ return 'inactive' if marker else 'unknown'
 def layer_status(gateway_active, agents_loaded, semantic_age, host_linked=False):
  """Coverage labels for the model and tool layers. semantic_age is seconds since the last routed semantic event."""
  if not gateway_active:model='not_connected'
@@ -50,6 +70,16 @@ def file_fingerprint(path, limit=1024*1024):
 def stat_is_regular(mode):
  import stat
  return stat.S_ISREG(mode)
+def lab_workload(pid, ppid, record, current_ticks):
+ """True when this pid is the registered lab process or a child it just spawned.
+
+ Short-lived commands can exit before /proc still has a ppid. The lab process may
+ list those pids in recentPids; that list is an explicit registration, not a guess.
+ """
+ if not record or str(current_ticks)!=str(record.get('startTicks')):return False
+ try:recent={int(x) for x in (record.get('recentPids') or [])}
+ except (TypeError,ValueError):recent=set()
+ return pid==int(record.get('pid') or 0) or ppid==int(record.get('pid') or 0) or pid in recent or ppid in recent
 def proc_key(pid):
  try:
   s=Path('/proc/'+str(pid)+'/stat').read_text().rsplit(')',1)[1].split();return {'startTicks':s[19],'ppid':int(s[1])}
@@ -91,8 +121,7 @@ class Adapter:
   lab=Path(self.config.get('labIdentity','/var/lib/agentreins-runtime/lab-identity.json'))
   try:
    v=json.loads(lab.read_text());current=proc_key(v['pid'])
-   if current.get('startTicks')==v['startTicks']:
-    if pid==v['pid'] or ppid==v['pid']:workload='runtime-lab';basis='受控实验父 PID 与 /proc 启动时刻匹配'
+   if lab_workload(pid, ppid, v, current.get('startTicks')):workload='runtime-lab';basis='受控实验父 PID 与 /proc 启动时刻匹配'
   except (OSError,ValueError,KeyError):pass
   if not workload and ppid in self.identities:
    parent=self.identities[ppid]
@@ -166,10 +195,9 @@ class Adapter:
   self.last_event=time.time();self.last_semantic=self.last_event;self.stats['normalized']+=1;self.stats['semantic']+=1;return e
  def heartbeat(self):
   def service(name):
-   try:return subprocess.run(['systemctl','is-active',name],capture_output=True,text=True,timeout=2).stdout.strip()
-   except Exception:return 'unknown'
+   return service_state(name)
   audit={}
-  try:audit=dict(line.split(None,1) for line in subprocess.check_output(['auditctl','-s'],text=True,timeout=2).splitlines() if len(line.split(None,1))==2)
+  try:audit=dict(line.split(None,1) for line in subprocess.check_output(['auditctl','-s'],text=True,timeout=2,stderr=subprocess.DEVNULL).splitlines() if len(line.split(None,1))==2)
   except Exception:pass
   host=service('agentreins-host-stream');aud=service('agentreins-audit-bridge');gateway=service('agentreins-semantic-gateway');active=host=='active' and aud=='active'
   semantic_age=None if self.last_semantic is None else time.time()-self.last_semantic
