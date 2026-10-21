@@ -56,3 +56,11 @@ pending → approved → executing → succeeded/failed；或 pending → denied
 - WebLens 映射可通过 `intelligenceMappings` 配置并记录依据，未知组件不再一律映射 S02/S05。人工采纳保存资产关联和理由，规则卡片展示建议；不会自动启用阻断或更改实际采集范围。
 
 回归：20 项原有测试 + `test_review_fixes.py` 10 项 + `test_public_api.py` 5 项。Grok SP01 在 Linux 重放 3000 条，唯一送达 3000 条、spoolDropped=0。Grok 用例复测采用新版明细鉴权，并给相对路径样例明确 cwd；原始用例保留。A08 是已声明的生产接入缺口；原脚本 A16 用无条件 False 判失败，用新增可配置映射/人工采纳 HTTP 用例验证替代，不能将原脚本宣称全部通过。
+
+## 后续修正：近期覆盖与下载路径（2026-10-21）
+
+降级判定改为最近 15 分钟损失增量与当前背压，窗口可配置 `lossWindowSeconds`（60–3600 秒）。历史累计值保留在 historicalLoss/drop，不因近期恢复而清空。增量存入 SQLite，重启仍可判断窗口；新接入已有损失的来源首次按当前观察到的损失记录，窗口过去且不再增长后恢复。未知 audit 计数仍为未知。
+
+curl/wget 显式输出参数与远端默认文件名优先于 shell stdout 重定向，`curl -o /tmp/a URL > /dev/null` 不会改记为 /dev/null；`-o-` 明确输出 stdout，不当作落地文件。无输出选项的 curl 才使用 stdout 重定向作为路径。
+
+宿主 netlink EXEC 在捕获时尝试补采 `/proc/<pid>/cwd`，读前后核对进程启动时刻，失败保持 null；runtime 继续优先使用 audit 的 cwd。短命进程和并发 chdir 仍有竞态，缺失工作目录时不猜测相对路径。

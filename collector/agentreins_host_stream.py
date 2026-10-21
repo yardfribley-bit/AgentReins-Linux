@@ -83,6 +83,17 @@ def read_cmdline(pid: int) -> str:
         return ""
 
 
+def read_cwd(pid: int):
+    """Read cwd at capture time; reject PID reuse across the read."""
+    try:
+        before = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19]
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+        after = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19]
+        return cwd if before == after else None
+    except (OSError, IndexError):
+        return None
+
+
 def read_ppid(pid: int) -> int:
     try:
         with open("/proc/%d/stat" % pid) as fh:
@@ -305,7 +316,7 @@ def proc_stream(cfg: argparse.Namespace) -> None:
                     "data": "ts_ns=%d parent=%s" % (ts_ns, mask_passwords(parent_cmd)),
                     "result": "CAPTURED" if cmdline else "PARTIAL_EVIDENCE",
                     "source": "netlink proc connector · PROC_EVENT_EXEC",
-                    "evidence": {"cmdline": mask_passwords(cmdline), "pid": pid,
+                    "evidence": {"cmdline": mask_passwords(cmdline), "pid": pid, "cwd": read_cwd(pid),
                                  "parent_cmd": mask_passwords(parent_cmd),
                                  "container_id": cid, "container": cname},
                 })

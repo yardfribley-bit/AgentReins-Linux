@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS gaps(source TEXT,start REAL,end REAL,PRIMARY KEY(sour
 CREATE TABLE IF NOT EXISTS exceptions(id TEXT PRIMARY KEY,expires REAL,payload TEXT);
 CREATE TABLE IF NOT EXISTS intel(id TEXT PRIMARY KEY,time REAL,payload TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
+CREATE TABLE IF NOT EXISTS coverage_losses(source TEXT,time REAL,audit INTEGER,sensor INTEGER);
+CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
 ''')
    c.execute('PRAGMA max_page_count=65536')
  @contextlib.contextmanager
@@ -52,7 +54,12 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
   now=self.clock();body=clean(body);body.update(source=source,receivedAt=now)
   body['serverRejected']=self.last_ingest.get(source,{}).get('rejectedTotal',0)
   with self.db() as c:
-   prev=c.execute('SELECT seen FROM sources WHERE id=?',(source,)).fetchone()
+   prev=c.execute('SELECT seen,payload FROM sources WHERE id=?',(source,)).fetchone()
+   old=json.loads(prev['payload']) if prev else {};oldloss,olda=loss_totals(old);newloss,newa=loss_totals(body)
+   sensor_delta=max(0,newloss-oldloss) if prev and old.get('bootId')==body.get('bootId') else newloss
+   audit_delta=max(0,(newa or 0)-(olda or 0)) if prev and old.get('bootId')==body.get('bootId') else (newa or 0)
+   if sensor_delta or audit_delta:c.execute('INSERT INTO coverage_losses VALUES(?,?,?,?)',(source,now,audit_delta,sensor_delta))
+   c.execute('DELETE FROM coverage_losses WHERE time<?',(now-86400,))
    if prev and now-prev['seen']>35:c.execute('INSERT OR REPLACE INTO gaps VALUES(?,?,?)',(source,prev['seen']+35,now))
    c.execute('INSERT OR REPLACE INTO sources VALUES(?,?,?)',(source,now,compact(body)))
  def coverage(self,c,source):
@@ -60,8 +67,12 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
   if not row:return {'source':source,'state':'unknown','layers':{},'limitations':['未收到独立心跳']}
   body=json.loads(row['payload']);fresh=now-row['seen']<35;gaps=[dict(x) for x in c.execute('SELECT start,end FROM gaps WHERE source=? ORDER BY start DESC LIMIT 20',(source,))]
   if not fresh:gaps.insert(0,{'start':row['seen']+35,'end':None})
-  counters=body.get('counters') or {};loss=sum(int(counters.get(k,0) or 0) for k in ('spoolDropped','expiredDropped','oversizeDropped','parseErrors','staleSkipped','rejectedEvents','rotationLost'));loss=max(loss,int(body.get('serverRejected',0)));audit=body.get('auditLost',body.get('drop'));degraded=bool(loss or (audit or 0)>0 or counters.get('backpressure',0))
-  return {**body,'state':('degraded' if degraded else 'online') if fresh else 'offline','auditLost':audit,'sensorLoss':loss,'degraded':degraded,'lossWarning':'检测窗口存在丢失、拒绝或积压，不能断言完整覆盖' if degraded else None,'ageSeconds':round(now-row['seen'],1),'gaps':gaps,'drop':(int(audit)+loss) if audit is not None else None,'limitations':['未提供的 drop 计数为未知；心跳在线不证明每条事件已采到']}
+  counters=body.get('counters') or {};loss,audit=loss_totals(body)
+  window=max(60,min(3600,int(self.config.get('lossWindowSeconds',900))))
+  recent=c.execute('SELECT coalesce(sum(audit),0),coalesce(sum(sensor),0) FROM coverage_losses WHERE source=? AND time>?',(source,now-window)).fetchone()
+  recent_audit,recent_sensor=recent[0],recent[1];degraded=bool(recent_audit or recent_sensor or counters.get('backpressure',0))
+  return {**body,'state':('degraded' if degraded else 'online') if fresh else 'offline','auditLost':audit,'sensorLoss':loss,'degraded':degraded,'lossWindowSeconds':window,'recentLoss':{'audit':recent_audit if audit is not None else None,'sensor':recent_sensor,'total':recent_audit+recent_sensor if audit is not None else None},'historicalLoss':{'audit':audit,'sensor':loss},'lossWarning':'近期检测窗口有丢失、拒绝或背压' if degraded else None,'ageSeconds':round(now-row['seen'],1),'gaps':gaps,'drop':(int(audit)+loss) if audit is not None else None,'limitations':['近期未增长不代表历史没有缺口；累计损失单独展示','工作目录来自 audit 或执行时 /proc；短命进程可能无法补采']}
+
  def source_fresh(self,c,source):
   r=c.execute('SELECT seen FROM sources WHERE id=?',(source,)).fetchone();return r and self.clock()-r['seen']<35
  def _suppressed(self,c,e,rule):
@@ -294,3 +305,8 @@ def canonical_command(s):
  except ValueError:return ' '.join(s.split())
 def risky_command(cmd):
  return bool(re.search(r'(?:curl|wget)\b.*\|\s*(?:/bin/)?(?:ba)?sh|\$\(\s*(?:curl|wget)\b|\bnc(?:at)?\b.*\s-e\s|rm\s+-rf|/dev/tcp/',cmd))
+
+def loss_totals(body):
+ counters=body.get('counters') or {}
+ sensor=sum(int(counters.get(k,0) or 0) for k in ('spoolDropped','expiredDropped','oversizeDropped','parseErrors','staleSkipped','rejectedEvents','rotationLost'))
+ return max(sensor,int(body.get('serverRejected',0))),body.get('auditLost',body.get('drop'))
