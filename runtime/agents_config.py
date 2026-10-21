@@ -48,6 +48,24 @@ def peer_allowed(peer, allowlist):
     return False
 
 
+def _as_list(value):
+    if value is None or value == '':
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _markers(raw):
+    markers = raw.get('knowledgeMarkers') if isinstance(raw, dict) else None
+    if not isinstance(markers, dict):
+        return None
+    start, end = str(markers.get('start') or ''), str(markers.get('end') or '')
+    if not start or not end or start == end:
+        return None
+    return {'start': start, 'end': end}
+
+
 def normalize_agent(raw):
     if not isinstance(raw, dict) or not raw.get('id'):
         raise ValueError('agent 需要 id')
@@ -55,13 +73,25 @@ def normalize_agent(raw):
     if not isinstance(gateway, dict):
         raise ValueError('gateway 必须是映射')
     containers = []
+    roles = []
     for item in raw.get('containers') or []:
         if isinstance(item, str):
             containers.append(item)
+            roles.append({'pattern': item, 'role': None})
         elif isinstance(item, dict) and item.get('pattern'):
-            containers.append(str(item['pattern']))
+            pattern = str(item['pattern'])
+            containers.append(pattern)
+            roles.append({'pattern': pattern, 'role': str(item['role']) if item.get('role') else None})
+    inbound = raw.get('inbound') if isinstance(raw.get('inbound'), dict) else {}
+    ports = []
+    for item in _as_list(inbound.get('port')):
+        try:
+            ports.append(int(item))
+        except (TypeError, ValueError):
+            continue
     agent_id = str(raw['id'])
     port = gateway.get('port')
+    tools = _as_list(raw.get('allowedTools')) if raw.get('allowedTools') else []
     return {
         'id': agent_id,
         'gateway': {
@@ -71,7 +101,20 @@ def normalize_agent(raw):
             'peerAllowlist': [str(x) for x in (gateway.get('peerAllowlist') or [])],
         },
         'containers': containers,
+        'containerRoles': roles,
         'allowedNetworks': raw.get('allowedNetworks') or [],
+        'allowedTools': [str(item) for item in tools],
+        'internalNetworks': list(raw.get('internalNetworks') or []),
+        'hostGateways': [str(item) for item in _as_list(raw.get('hostGateways'))],
+        'webServers': [str(item) for item in _as_list(raw.get('webServers'))],
+        'knowledgeMarkers': _markers(raw),
+        'inbound': {
+            'vhost': [str(item).lower() for item in _as_list(inbound.get('vhost'))],
+            'port': ports,
+            'pathPrefix': [str(item) for item in _as_list(inbound.get('pathPrefix'))],
+            'loginPaths': [str(item) for item in _as_list(inbound.get('loginPaths'))],
+            'logSource': str(inbound.get('logSource') or ''),
+        },
     }
 
 
@@ -100,6 +143,96 @@ def agent_for_container(agents, name):
         if any(pattern_match(pattern, name) for pattern in agent['containers']):
             return agent
     return None
+
+
+def role_for_container(agent, name):
+    if not agent or not name:
+        return None
+    for item in agent.get('containerRoles') or []:
+        if pattern_match(item.get('pattern'), name) and item.get('role'):
+            return item['role']
+    return None
+
+
+def _request_vhost(record):
+    raw = str(record.get('vhost') or record.get('host') or record.get('http_host') or '').strip().lower()
+    if raw.startswith('['):
+        return raw.split(']', 1)[0][1:]
+    return raw.split(':', 1)[0]
+
+
+def _request_port(record):
+    for key in ('port', 'server_port'):
+        if record.get(key) not in (None, ''):
+            try:
+                return int(record.get(key))
+            except (TypeError, ValueError):
+                return 0
+    host = str(record.get('vhost') or record.get('host') or '')
+    if host.startswith('['):
+        _head, _, tail = host[1:].partition(']')
+        if tail.startswith(':') and tail[1:].isdigit():
+            return int(tail[1:])
+        return 0
+    if host.count(':') == 1 and host.split(':', 1)[1].isdigit():
+        return int(host.split(':', 1)[1])
+    return 0
+
+
+def request_path(record):
+    raw = str(record.get('path') or record.get('uri') or record.get('request_uri') or '/')
+    path = raw.split('?', 1)[0] or '/'
+    if not path.startswith('/'):
+        path = '/' + path
+    return path[:512]
+
+
+def _prefix_ok(path, prefixes):
+    if not prefixes:
+        return True
+    for prefix in prefixes:
+        prefix = str(prefix)
+        if prefix == '/' or path == prefix:
+            return True
+        base = prefix.rstrip('/')
+        if base and (path.startswith(base + '/') or path.startswith(prefix)):
+            return True
+    return False
+
+
+def agent_for_access(agents, record, log_source=''):
+    """Map one access-log record to a single agent. Ambiguous matches are dropped."""
+    if not isinstance(record, dict):
+        return None
+    vhost = _request_vhost(record)
+    port = _request_port(record)
+    path = request_path(record)
+    source = str(log_source or record.get('logSource') or '')
+    matched = []
+    for agent in agents or []:
+        inbound = agent.get('inbound') or {}
+        if not any(inbound.get(key) for key in ('vhost', 'port', 'pathPrefix', 'logSource')):
+            continue
+        if inbound.get('logSource') and source != inbound['logSource']:
+            continue
+        if inbound.get('vhost') and vhost not in inbound['vhost']:
+            continue
+        if inbound.get('port') and port not in inbound['port']:
+            continue
+        if not _prefix_ok(path, inbound.get('pathPrefix')):
+            continue
+        matched.append(agent)
+    if len(matched) == 1:
+        return matched[0]
+    return None
+
+
+def login_path(agent, path):
+    for prefix in (agent.get('inbound') or {}).get('loginPaths') or []:
+        prefix = str(prefix)
+        if path == prefix or path.startswith(prefix.rstrip('/') + '/'):
+            return True
+    return False
 
 
 def agent_by_id(agents, agent_id):

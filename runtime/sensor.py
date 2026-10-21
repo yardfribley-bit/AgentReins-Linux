@@ -6,9 +6,9 @@ try:from .gate_client import Client
 except ImportError:from gate_client import Client
 try:from .command_parse import parse as parse_command
 except ImportError:from command_parse import parse as parse_command
-try:from .agents_config import load_agents, agent_for_container, session_from_container
-except ImportError:from agents_config import load_agents, agent_for_container, session_from_container
-VERSION='runtime-1.3-s02s03'
+try:from .agents_config import load_agents, agent_for_container, session_from_container, role_for_container
+except ImportError:from agents_config import load_agents, agent_for_container, session_from_container, role_for_container
+VERSION='runtime-1.4-http'
 SEMANTIC_OPS={'MODEL_REQUEST','MODEL_RESPONSE','TOOL_CALL','TOOL_RESULT'}
 ENRICHMENT_ATTRIBUTION={'DIRECT_API_EVENT','DIRECT_API_STATE','EXECUTOR_RUNTIME_ID'}
 # Plain-process deploys have no systemd unit. Coverage still needs to see whether the collector is running.
@@ -143,7 +143,21 @@ class Adapter:
   if pid and p.get('startTicks'):self.identities[pid]={'workload':workload,'startTicks':p['startTicks'],'seen':time.time(),'agentId':agent['id'] if agent else None,'sessionId':session_from_container(workload)}
   if len(self.identities)>2000:self.identities={k:v for k,v in self.identities.items() if time.time()-v['seen']<120}
   return workload,ident
+ def _decorate_agent(self,e,agent):
+  if not agent:return
+  policy=dict(e.get('policy') or {})
+  for key in ('allowedNetworks','hostGateways','allowedTools','webServers'):
+   if agent.get(key) and key not in policy:policy[key]=agent[key]
+  peers=[]
+  for other in self.agents:
+   if other.get('id')!=agent.get('id'):peers.extend(other.get('internalNetworks') or [])
+  if peers and 'peerInternalNetworks' not in policy:policy['peerInternalNetworks']=peers
+  if policy:e['policy']=policy
+  role=role_for_container(agent,e.get('workload'))
+  if role:e['containerRole']=role
  def normalize(self,r):
+  if r.get('operation')=='HTTP_SUMMARY' or r.get('category')=='http':
+   return self.normalize_http(r)
   if r.get('category')=='semantic' or r.get('operation') in SEMANTIC_OPS|{'MODEL_REASONING','MODEL_INTERRUPTED','MODEL_ERROR','MODEL_REJECTED','DIFY_EXECUTION_STATE'}:
    return self.normalize_semantic(r)
   if r.get('operation') not in ('AUDIT_EXEC','EXEC','AUDIT_FILE','AUDIT_CONNECT','AUDIT_SENDTO'):return None
@@ -172,12 +186,18 @@ class Adapter:
    e['agentId']=ident['agentId'];e['confidence']='observed'
    if ident.get('sessionId'):e['sessionId']=ident['sessionId']
    agent=agent_for_container(self.agents,workload)
-   if agent and agent.get('allowedNetworks') and 'allowedNetworks' not in (e.get('policy') or {}):
-    e['policy']=dict(e.get('policy') or {});e['policy']['allowedNetworks']=agent['allowedNetworks']
+   self._decorate_agent(e,agent)
   if workload=='runtime-lab':
    try:e['runId']=json.loads(Path(self.config.get('labIdentity','/var/lib/agentreins-runtime/lab-identity.json')).read_text()).get('runId')
    except (OSError,ValueError):pass
   self.last_event=time.time();self.stats['normalized']+=1;return e
+ def normalize_http(self,r):
+  if r.get('operation')!='HTTP_SUMMARY':return None
+  ev=r.get('evidence') or {}
+  agent=ev.get('agentId') or r.get('agentId')
+  if not agent:return None
+  e={'id':r.get('eventKey') or hashlib.sha256(json.dumps({'op':'HTTP_SUMMARY','a':agent,'w':ev.get('windowStart'),'s':ev.get('logSource')},sort_keys=True).encode()).hexdigest(),'time':timestamp(r.get('time')),'workload':'http:'+str(agent),'agentId':str(agent),'kind':'http','operation':'HTTP_SUMMARY','identity':{'basis':'入站访问日志映射','bootId':self.boot,'pid':0,'containerId':None,'agentId':str(agent)},'pid':0,'ppid':0,'containerId':None,'result':'success','confidence':'observed','windowStart':ev.get('windowStart'),'windowSeconds':ev.get('windowSeconds') or 60,'logSource':ev.get('logSource') or r.get('resource') or '','clients':ev.get('clients') or [],'totals':ev.get('totals') or {},'categoryHits':ev.get('categoryHits') or [],'sourceEvidence':{'source':r.get('source')}}
+  self.last_event=time.time();self.stats['normalized']+=1;self.stats['http']+=1;return e
  def normalize_semantic(self,r):
   ev=r.get('evidence') or {}
   if ev.get('attribution') in ENRICHMENT_ATTRIBUTION or r.get('component') in ('DifyAPIObserver','DifyLiveObserver','REAExecutor'):
@@ -188,10 +208,10 @@ class Adapter:
   if not agent or ev.get('confidence')=='unknown' or ev.get('chainConfidence')=='unknown':
    self.stats['semanticUnbound']+=1;return None
   kind='tool' if op in ('TOOL_CALL','TOOL_RESULT') else 'model'
-  policy={}
+  e={'id':r.get('eventKey') or hashlib.sha256(json.dumps({'op':op,'t':r.get('time'),'a':agent,'r':ev.get('requestId'),'tool':ev.get('toolCallId')},sort_keys=True).encode()).hexdigest(),'time':timestamp(r.get('time')),'workload':'gateway:'+str(agent),'agentId':agent,'kind':kind,'operation':op,'identity':{'basis':ev.get('routeBasis') or '网关路由绑定','bootId':self.boot,'pid':0,'containerId':None,'agentId':agent},'pid':0,'ppid':0,'containerId':None,'result':'success','confidence':'observed','chainId':ev.get('chainId'),'runId':ev.get('chainId'),'requestId':ev.get('requestId'),'toolCallId':ev.get('toolCallId'),'toolName':ev.get('toolName'),'argsDigest':ev.get('argsDigest'),'argsEntities':ev.get('argsEntities') or {},'untrustedSegments':ev.get('untrustedSegments') or [],'chainHasUntrusted':bool(ev.get('chainHasUntrusted')),'textExcerpt':(ev.get('textExcerpt') or '')[:2048],'sessionId':ev.get('sessionId'),'policy':{},'sourceEvidence':{'source':r.get('source'),'peer':ev.get('peer'),'attribution':ev.get('attribution') or 'CLIENT_CONNECTION'}}
+  if ev.get('secretFindings'):e['secretFindings']=ev.get('secretFindings')
   for item in self.agents:
-   if item['id']==agent and item.get('allowedNetworks'):policy={'allowedNetworks':item['allowedNetworks']}
-  e={'id':r.get('eventKey') or hashlib.sha256(json.dumps({'op':op,'t':r.get('time'),'a':agent,'r':ev.get('requestId'),'tool':ev.get('toolCallId')},sort_keys=True).encode()).hexdigest(),'time':timestamp(r.get('time')),'workload':'gateway:'+str(agent),'agentId':agent,'kind':kind,'operation':op,'identity':{'basis':ev.get('routeBasis') or '网关路由绑定','bootId':self.boot,'pid':0,'containerId':None,'agentId':agent},'pid':0,'ppid':0,'containerId':None,'result':'success','confidence':'observed','chainId':ev.get('chainId'),'runId':ev.get('chainId'),'requestId':ev.get('requestId'),'toolCallId':ev.get('toolCallId'),'toolName':ev.get('toolName'),'argsDigest':ev.get('argsDigest'),'argsEntities':ev.get('argsEntities') or {},'untrustedSegments':ev.get('untrustedSegments') or [],'chainHasUntrusted':bool(ev.get('chainHasUntrusted')),'textExcerpt':(ev.get('textExcerpt') or '')[:2048],'sessionId':ev.get('sessionId'),'policy':policy,'sourceEvidence':{'source':r.get('source'),'peer':ev.get('peer'),'attribution':ev.get('attribution') or 'CLIENT_CONNECTION'}}
+   if item['id']==agent:self._decorate_agent(e,item);break
   self.last_event=time.time();self.last_semantic=self.last_event;self.stats['normalized']+=1;self.stats['semantic']+=1;return e
  def heartbeat(self):
   def service(name):
@@ -202,7 +222,7 @@ class Adapter:
   host=service('agentreins-host-stream');aud=service('agentreins-audit-bridge');gateway=service('agentreins-semantic-gateway');active=host=='active' and aud=='active'
   semantic_age=None if self.last_semantic is None else time.time()-self.last_semantic
   model,tool=layer_status(gateway=='active',bool(self.agents),semantic_age)
-  return {'host':socket.gethostname(),'version':VERSION,'bootId':self.boot,'layers':{'process':'active' if active else 'unavailable','network':'active' if aud=='active' else 'unavailable','file':'watched_paths_only' if aud=='active' else 'unavailable','model':model,'tool':tool},'auditLost':int(audit['lost']) if audit.get('lost','').isdigit() else None,'drop':(int(audit['lost'])+sum(self.stats[k] for k in ('spoolDropped','expiredDropped','oversizeDropped','parseErrors','staleSkipped','rejectedEvents','rotationLost'))) if audit.get('lost','').isdigit() else None,'auditBacklog':audit.get('backlog'),'counters':dict(self.stats),'lastEvent':self.last_event,'lastSemantic':self.last_semantic,'workloads':self.containers,'agentRoutes':[a['id'] for a in self.agents],'fileWatchScope':self.config.get('fileWatchScope',[]),'fileWatchCategories':self.config.get('fileWatchCategories',{}),'persistWatchCategories':self.config.get('persistWatchCategories',{}),'unwatchedCategories':self.config.get('unwatchedCategories',[]),'serviceState':{'host':host,'audit':aud,'gateway':gateway},'policyStatus':{'S05':'per-workload; disabled if no allowedNetworks configured','S02':'requires untrusted segment plus exact destination match','S03':'semantic stage then host confirmation','S08':'alert only; no restore'},'limitations':['同一 Dify 实例的多个应用无法按容器拆开','Dify bridge 只作旁路，不触发 S02/S03','volume 与 bind mount 不在容器 upperdir','内核不阻断']}
+  return {'host':socket.gethostname(),'version':VERSION,'bootId':self.boot,'layers':{'process':'active' if active else 'unavailable','network':'active' if aud=='active' else 'unavailable','file':'watched_paths_only' if aud=='active' else 'unavailable','model':model,'tool':tool},'auditLost':int(audit['lost']) if audit.get('lost','').isdigit() else None,'drop':(int(audit['lost'])+sum(self.stats[k] for k in ('spoolDropped','expiredDropped','oversizeDropped','parseErrors','staleSkipped','rejectedEvents','rotationLost'))) if audit.get('lost','').isdigit() else None,'auditBacklog':audit.get('backlog'),'counters':dict(self.stats),'lastEvent':self.last_event,'lastSemantic':self.last_semantic,'workloads':self.containers,'agentRoutes':[a['id'] for a in self.agents],'fileWatchScope':self.config.get('fileWatchScope',[]),'fileWatchCategories':self.config.get('fileWatchCategories',{}),'persistWatchCategories':self.config.get('persistWatchCategories',{}),'unwatchedCategories':self.config.get('unwatchedCategories',[]),'serviceState':{'host':host,'audit':aud,'gateway':gateway},'policyStatus':{'S05':'per-workload; disabled if no allowedNetworks configured','S02':'requires untrusted segment plus exact destination match','S03':'semantic stage then host confirmation','S08':'alert only; no restore','S13':'tool args; category and digest only','S16':'IP literals outside allowedNetworks; empty allowlist still matches metadata and loopback','S17':'60s http summary; per client','S19':'login path 401/403 burst'},'limitations':['同一 Dify 实例的多个应用无法按容器拆开','Dify bridge 只作旁路，不触发 S02/S03','volume 与 bind mount 不在容器 upperdir','内核不阻断','入站 HTTP 只接收 60 秒汇总，原始行留在本机','入站 Web 与模型链路只按 agent 和时间窗并排，关联为 inferred']}
 class LogPump:
  """At-least-once log delivery: bounded pending batch, cursor advances only on ACK."""
  def __init__(self,client,adapter,config):

@@ -5,5 +5,13 @@
   "sources": {"host-01": "REPLACE_WITH_SOURCE_TOKEN"},
   "maxEvents": 200000,
   "maxEventsPerSource": 80000,
-  "lossWindowSeconds": 900
+  "lossWindowSeconds": 900,
+  "httpThresholds": {
+    "distinctPaths": 20,
+    "notFound": 20,
+    "authFailures": 8,
+    "errorRate": 0.5,
+    "minSample": 30,
+    "categoryHits": 3
+  }
 }

@@ -121,6 +121,49 @@ host-stream 与 audit 的 argv 现用 `shlex.join` 保留引号，因此 `bash -
 
 ### 验证
 
-`PYTHONPATH=. python3 -m unittest tests.runtime.test_s02s03 tests.runtime.test_runtime tests.runtime.test_review_fixes tests.runtime.test_next_iteration tests.runtime.test_public_api tests.policy.test_compiler tests.test_console_observation tests.test_history_retention`
+`PYTHONPATH=. python3 -m unittest tests.runtime.test_s02s03 tests.runtime.test_runtime tests.runtime.test_review_fixes tests.runtime.test_next_iteration tests.runtime.test_public_api tests.runtime.test_capability tests.policy.test_compiler tests.test_console_observation tests.test_history_retention`
 
-覆盖 V1–V6、F1–F4、S08 哈希、导出哈希链、upperdir 的 whiteout 删除，以及既有运行时用例。控制台列表会显示 phase、confidence、agentId、chainId；匿名公开投影的字段范围保持不变。
+覆盖 V1–V6、F1–F4、S08 哈希、导出哈希链、upperdir 的 whiteout 删除、入站汇总与 S13–S22，以及既有运行时用例。控制台列表会显示 phase、confidence、agentId、chainId、layer；处置身份可以按 chainId、agentId、layer 筛选和分组。匿名公开投影的字段范围保持不变，也不能用这些字段过滤。
+
+## 演练准备：入站 HTTP 与决策层（2026-10-21）
+
+S01–S08 的含义不变。S09–S11 仍留给 Mac。S12 不在本次范围。新增规则都是只告警：S13 凭据出现在外发类工具参数，S14 未登记工具，S15 工具频率，S16 参数指向元数据、回环、宿主机网关或其他 Agent 网段，S17 入站路径突发，S18 入站错误率，S19 登录失败突发，S20 应用容器连到这些地址，S21 入站 URI/UA 类别计数，S22 Web 服务派生 shell 或下载工具。S02/S03 仍是语义段再按主机实体升级；HTTP 汇总不会升级它们。入站告警和模型链路只按同一 agentId、前后 120 秒并排，关联标为 inferred。
+
+### 入站汇总
+
+`collector/http_access.py` 跟踪 JSON 访问日志。agents.yaml 的 `inbound` 用 vhost、端口、路径前缀和可选的 logSource 映射到一个 agent；对上多个或一个都对不上就丢弃。登录路径前缀 `loginPaths` 只用来数 401/403。每个日志来源、每个 agent、每个 60 秒窗口只向 host.jsonl 写一条 `HTTP_SUMMARY`。原始行另写本地 JSONL，并先做凭据遮盖。汇总里是计数和路径哈希，没有请求 URI。类别命中也是窗口内的计数，不是逐条请求。
+
+nginx 需要 JSON 日志，例如：
+
+```
+log_format agentreins escape=json '{"time":"$time_iso8601","remote_addr":"$remote_addr","vhost":"$host","port":$server_port,"path":"$uri","query":"$args","status":$status,"ua":"$http_user_agent"}';
+```
+
+把该 access_log 挂到采集器能读的路径。Dify 自带 nginx 的日志也要挂出来。这是宿主机配置，仓库里的单元不会去改正在跑的 nginx。
+
+### 阈值与开关
+
+runtime 的 config.json 可写 `httpThresholds`。缺省是 distinctPaths 20、notFound 20、authFailures 8、errorRate 0.5、minSample 30、categoryHits 3。单次登录失败低于默认值。`toolThresholds` 不写则 S15 不启用；写上 `perMinute` 和 `perChainTool` 后才计数，0 表示关掉那一侧。`allowedTools` 为空或不写则 S14 不启用。`webServers` 不写则 S22 不启用。`knowledgeMarkers` 不写则不会把系统提示里的文字当成知识库；标记缺了结束符时，该段可信度是 unknown，不会触发 S02/S03。
+
+S16 和 S20 只认 IP 字面量：169.254.0.0/16、127.0.0.0/8、::1，再加上该 agent 的 hostGateways 和其他 agent 的 internalNetworks。目的地址落在本 agent 的 allowedNetworks 里则不告警。allowedNetworks 为空也不会关掉这两条。容器角色来自 containers 里更窄的 pattern；database 和 cache 不触发 S20，sandbox 不触发 S22。ssrf_proxy 的访问日志格式还没核对，这一版不解析它。
+
+### 控制台与回放
+
+处置身份的告警列表可以带 `chainId`、`agentId`、`layer`，`group` 取 chain、agent 或 layer。详情里同 chainId 的其他告警，以及同 agent 时间窗内的 S17/S18/S19/S21，会列在旁边。匿名请求即使带上这些参数，也不会缩小结果，响应里也没有这些字段。
+
+本地回放：
+
+```
+PYTHONPATH=. python3 scripts/replay_capability.py /tmp/cap-replay
+PYTHONPATH=. python3 scripts/false_alarm_baseline.py /tmp/cap-baseline
+```
+
+两条都只用占位标记和文档地址。
+
+### 部署
+
+1. 把 `runtime/http_rules.py` 和更新后的 engine、sensor、server、agents_config、semantic_extract、redact、app.js 放到 `/opt/agentreins-runtime`。
+2. 把 `collector/http_access.py` 和更新后的 `semantic_gateway.py` 放到 `/opt/agentreins/`。`deploy/agentreins-http-access.service` 是汇总进程的样例，确认日志路径后再启用。
+3. 编辑 `/etc/agentreins/agents.yaml` 的 inbound，把样例里的 `.invalid` 和 RFC 5737 网段换成这台机器的 vhost 和网桥。不要把真实地址提交回仓库。
+4. 需要 S14、S15、S22 或知识库标记时再写入对应字段。S20 要给应用容器单独的 pattern 和 role，不要把数据库容器标成 api。
+5. 传感器版本字符串是 `runtime-1.4-http`。重启 runtime、sensor 和语义网关后，新规则才会出现在 `/runtime/api/rules`。

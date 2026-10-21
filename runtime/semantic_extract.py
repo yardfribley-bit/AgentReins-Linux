@@ -73,7 +73,49 @@ def _source_kind(message):
     return ''
 
 
-def untrusted_segments(messages):
+def knowledge_segments(messages, markers):
+    """Mark an explicit knowledge span. Missing or rewritten markers stay unknown."""
+    if not isinstance(markers, dict):
+        return []
+    start, end = str(markers.get('start') or ''), str(markers.get('end') or '')
+    if not start or not end or start == end:
+        return []
+    found = []
+    for message in messages or []:
+        if not isinstance(message, dict) or str(message.get('role') or '') not in ('system', 'developer'):
+            continue
+        raw = content_text(message.get('content'))
+        pos = 0
+        while pos < len(raw):
+            begin = raw.find(start, pos)
+            if begin < 0:
+                break
+            finish = raw.find(end, begin + len(start))
+            if finish < 0:
+                found.append({
+                    'role': str(message.get('role') or 'system'),
+                    'sourceKind': 'knowledge',
+                    'digest': digest_text(raw[begin:begin + len(start)]),
+                    'excerpt': '',
+                    'truncated': True,
+                    'confidence': 'unknown',
+                })
+                break
+            span = raw[begin + len(start):finish]
+            cleaned, truncated = _excerpt(span, EXCERPT_LIMIT)
+            found.append({
+                'role': str(message.get('role') or 'system'),
+                'sourceKind': 'knowledge',
+                'digest': digest_text(span),
+                'excerpt': cleaned,
+                'truncated': truncated,
+                'confidence': 'observed',
+            })
+            pos = finish + len(end)
+    return found
+
+
+def untrusted_segments(messages, markers=None):
     """Segments that can trigger S02/S03 have confidence observed. Unknown never triggers."""
     segments = []
     for message in messages or []:
@@ -101,6 +143,7 @@ def untrusted_segments(messages):
             'truncated': truncated,
             'confidence': confidence,
         })
+    segments.extend(knowledge_segments(messages, markers))
     return segments
 
 
@@ -288,7 +331,7 @@ class ChainBook:
         self.order = []
         self.limit = limit
 
-    def observe_request(self, request_id, messages):
+    def observe_request(self, request_id, messages, markers=None):
         echoed = []
         for message in messages or []:
             if not isinstance(message, dict):
@@ -311,7 +354,7 @@ class ChainBook:
         else:
             chain_id = request_id
             joined = False
-        segments = untrusted_segments(messages)
+        segments = untrusted_segments(messages, markers)
         if triggering_untrusted(segments) and not conflict:
             self.chain_untrusted[chain_id] = True
         return {

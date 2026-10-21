@@ -56,6 +56,7 @@ class App:
      if path in assets:
       name,ctype=assets[path];return self.send(200,(app.root/name).read_bytes(),ctype)
      if path=='/runtime/api/alerts':
+      # chainId, agentId, layer, and group are operator-only. Anonymous callers must not filter on them.
       safe_q=q if principal and principal['role']=='operator' else {k:v for k,v in q.items() if k in ('rule','severity','status','offset','limit')}
       data=app.store.listing(safe_q)
       if not principal or principal['role']!='operator':

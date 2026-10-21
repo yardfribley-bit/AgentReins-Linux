@@ -21,17 +21,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 def _imports():
     try:
         from runtime.agents_config import load_agents, peer_allowed, resolve_route
-        from runtime.redact import redact_text
+        from runtime.redact import redact_text, secret_findings
         from runtime.semantic_extract import ChainBook, content_text, extract_entities, triggering_untrusted, untrusted_segments
-        return load_agents, peer_allowed, resolve_route, redact_text, ChainBook, content_text, extract_entities, triggering_untrusted, untrusted_segments
+        return load_agents, peer_allowed, resolve_route, redact_text, secret_findings, ChainBook, content_text, extract_entities, triggering_untrusted, untrusted_segments
     except ImportError:
         sys.path.insert(0, os.environ.get('AGENTREINS_RUNTIME', '/opt/agentreins-runtime'))
         from agents_config import load_agents, peer_allowed, resolve_route
-        from redact import redact_text
+        from redact import redact_text, secret_findings
         from semantic_extract import ChainBook, content_text, extract_entities, triggering_untrusted, untrusted_segments
-        return load_agents, peer_allowed, resolve_route, redact_text, ChainBook, content_text, extract_entities, triggering_untrusted, untrusted_segments
+        return load_agents, peer_allowed, resolve_route, redact_text, secret_findings, ChainBook, content_text, extract_entities, triggering_untrusted, untrusted_segments
 
-load_agents, peer_allowed, resolve_route, redact_text, ChainBook, content_text, extract_entities, triggering_untrusted, untrusted_segments = _imports()
+load_agents, peer_allowed, resolve_route, redact_text, secret_findings, ChainBook, content_text, extract_entities, triggering_untrusted, untrusted_segments = _imports()
 
 UPSTREAM = os.environ.get('AGENTREINS_UPSTREAM', 'https://api.openai.com/v1').rstrip('/')
 OUT = os.environ.get('AGENTREINS_HOST_LOG', '/var/log/agentreins/host.jsonl')
@@ -130,7 +130,7 @@ class Gateway:
                 }
             chain_state = {'chainId': rid, 'chainConfidence': 'observed', 'untrustedSegments': [], 'chainHasUntrusted': False, 'conflict': False}
             if isinstance(payload, dict) and payload.get('messages'):
-                chain_state = self.chain.observe_request(rid, payload.get('messages'))
+                chain_state = self.chain.observe_request(rid, payload.get('messages'), (agent or {}).get('knowledgeMarkers'))
                 if chain_state.get('conflict'):
                     route_evidence = dict(route_evidence)
                     route_evidence['chainConfidence'] = 'unknown'
@@ -218,7 +218,9 @@ class Gateway:
         function = tool.get('function') or {}
         name = function.get('name') or ''
         arguments = function.get('arguments') if function.get('arguments') is not None else ''
-        entities = extract_entities(name, arguments)
+        raw_arguments = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+        entities = extract_entities(name, raw_arguments)
+        findings = secret_findings(raw_arguments)
         tool_id = tool.get('id') or ''
         chain_id = chain_state.get('chainId') or evidence.get('chainId')
         if tool_id and chain_state.get('chainConfidence') != 'unknown':
@@ -230,8 +232,9 @@ class Gateway:
             'argsDigest': entities.get('argsDigest'),
             'argsEntities': {k: entities.get(k) for k in ('urls', 'hosts', 'paths', 'commands')},
             'chainHasUntrusted': chain_state.get('chainHasUntrusted') or bool(triggering_untrusted(chain_state.get('untrustedSegments'))),
+            'secretFindings': findings,
         })
-        body = {'id': tool_id, 'type': tool.get('type') or 'function', 'function': {'name': name, 'arguments': redact_text(arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False))[:4096]}}
+        body = {'id': tool_id, 'type': tool.get('type') or 'function', 'function': {'name': name, 'arguments': redact_text(raw_arguments)[:4096]}}
         self.emit('TOOL_CALL', rid, body, peer, evidence=tool_evidence)
 
     def _response_summary(self, decoded):

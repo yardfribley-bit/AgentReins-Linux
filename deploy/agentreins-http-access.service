@@ -1,0 +1,16 @@
+[Unit]
+Description=AgentReins HTTP access-log summaries
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/agentreins/gateway.env
+Environment=PYTHONPATH=/opt/agentreins-runtime
+Environment=AGENTREINS_RUNTIME=/opt/agentreins-runtime
+ExecStart=/usr/bin/python3 /opt/agentreins/http_access.py --agents /etc/agentreins/agents.yaml --access-log /var/log/nginx/agentreins-access.jsonl --out /var/log/agentreins/host.jsonl --raw /var/log/agentreins/http-raw.jsonl
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

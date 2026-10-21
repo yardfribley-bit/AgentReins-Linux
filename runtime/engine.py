@@ -2,9 +2,9 @@
 import contextlib,copy,hashlib,hmac,ipaddress,json,re,sqlite3,time,uuid,fnmatch,shlex
 from pathlib import Path
 try:
- from runtime.redact import redact_text
+ from runtime.redact import redact_text, secret_findings
 except ImportError:
- from redact import redact_text
+ from redact import redact_text, secret_findings
 
 RULES=[
  {'id':'S01','version':'1.0','name':'敏感凭据路径访问','severity':'high','sources':['file'],'condition':'已登记工作负载成功以读取权限打开敏感路径，或尝试访问被拒绝','falsePositive':'部署与密钥轮换可能合法；按工作负载、路径、动作和期限加白','mode':'alert','limitation':'读取权限打开不证明读取了文件正文；不采集凭据内容'},
@@ -13,7 +13,32 @@ RULES=[
  {'id':'S04','version':'1.0','name':'下载文件后执行','severity':'high','sources':['process','network','file'],'condition':'同一工作负载内下载命令指定的落地路径，被后续进程执行','falsePositive':'合法安装/更新也会命中，必须审阅来源与任务','mode':'alert','limitation':'shell 启动本身不触发；下载/执行按路径与工作负载形成 candidate'},
  {'id':'S05','version':'1.0','name':'授权范围外连接','severity':'high','sources':['network'],'condition':'配置非空网络授权范围的工作负载连接未获允许的目的 IP/端口','falsePositive':'需包含 DNS、模型服务、CDN 与代理实际路径','mode':'alert','limitation':'未配置时不启用；连接尝试不等于已外传数据'},
  {'id':'P01','version':'1.0','name':'已接入工具执行前审批','severity':'medium','sources':['tool'],'condition':'受保护执行器即将执行一个具体调用','falsePositive':'审批请求不是危险行为已发生；这是显式工具保护策略','mode':'require_approval','limitation':'仅保护已接入的 REA analyze 与固定范围实验执行器，不覆盖任意 Dify 工具'},
- {'id':'S08','version':'1.0','name':'敏感文件被修改','severity':'high','sources':['file'],'condition':'已登记工作负载写入敏感凭据或持久化路径','falsePositive':'密钥轮换、软件包安装和用户 shell 配置更新可能合法','mode':'alert','limitation':'只告警，不阻断、不回滚；敏感文件只保留哈希和大小，不保留正文；volume 与 bind mount 不在容器 upperdir 中'}]
+ {'id':'S08','version':'1.0','name':'敏感文件被修改','severity':'high','sources':['file'],'condition':'已登记工作负载写入敏感凭据或持久化路径','falsePositive':'密钥轮换、软件包安装和用户 shell 配置更新可能合法','mode':'alert','limitation':'只告警，不阻断、不回滚；敏感文件只保留哈希和大小，不保留正文；volume 与 bind mount 不在容器 upperdir 中'},
+ {'id':'S13','version':'1.0','name':'工具参数携带敏感数据','severity':'high','sources':['tool'],'condition':'外发类工具调用的参数会被凭据遮盖规则命中','falsePositive':'把凭据传给已允许的内部 API','mode':'alert','limitation':'只保留命中类别和摘要哈希，不保留原值；编码或分段拼接看不到'},
+ {'id':'S14','version':'1.0','name':'调用未登记工具','severity':'medium','sources':['tool'],'condition':'agent 配置了非空 allowedTools，且 toolName 不在其中','falsePositive':'新上线的工具还没登记','mode':'alert','limitation':'未配置 allowedTools 时不启用；不自动阻断'},
+ {'id':'S15','version':'1.0','name':'工具调用频率异常','severity':'medium','sources':['tool'],'condition':'同一 agent 每分钟的工具调用，或同一链路内同一工具的次数，达到配置阈值','falsePositive':'批处理任务','mode':'alert','limitation':'未配置 toolThresholds 时不启用；超过后按五分钟聚合'},
+ {'id':'S16','version':'1.0','name':'工具参数指向内网、元数据或本机','severity':'high','sources':['tool'],'condition':'参数中的 IP 落在元数据段、回环、宿主机网关或其他 Agent 网段，且不在该 Agent 的允许范围','falsePositive':'Agent 本来就要访问的内部服务','mode':'alert','limitation':'只匹配 IP 字面量；不看主机名；空的允许范围不关闭这条规则；不自动阻断'},
+ {'id':'S17','version':'1.0','name':'入站扫描或路径枚举','severity':'medium','sources':['http'],'condition':'同一来源对同一 agent 的入口，在 60 秒汇总内不同路径数或 404 数达到阈值','falsePositive':'前端静态资源缺失、健康检查','mode':'alert','limitation':'只覆盖已接入的 HTTP 访问日志；阈值可用 httpThresholds 调整'},
+ {'id':'S18','version':'1.0','name':'入站错误率突增','severity':'medium','sources':['http'],'condition':'同一 agent 入口 60 秒汇总内 4xx 或 5xx 比例达到阈值，且请求数达到最小样本','falsePositive':'后端故障、发布','mode':'alert','limitation':'不区分攻击和故障，只作为信号'},
+ {'id':'S19','version':'1.0','name':'认证失败突发','severity':'high','sources':['http'],'condition':'同一来源对已登记登录路径，在 60 秒汇总内 401/403 次数达到阈值','falsePositive':'用户输错一次、令牌过期后的少量重试','mode':'alert','limitation':'需要在 agents.yaml 登记登录路径前缀；默认阈值高于单次失败'},
+ {'id':'S20','version':'1.0','name':'应用容器连接元数据或内网','severity':'high','sources':['network'],'condition':'web/api/worker/plugin/sandbox 角色的容器连接元数据段、回环、宿主机网关或其他 Agent 网段','falsePositive':'健康探测打到已允许的地址','mode':'alert','limitation':'数据库和缓存角色不触发；ssrf_proxy 日志未接入，代理后的真实目的看不到'},
+ {'id':'S21','version':'1.0','name':'入站请求特征类别','severity':'medium','sources':['http'],'condition':'60 秒汇总内同一来源的 URI 或 UA 类别计数达到阈值','falsePositive':'搜索框里的普通文本、安全团队自己的探测','mode':'alert','limitation':'只保留类别和计数，不保留原始 URI；编码可以绕过'},
+ {'id':'S22','version':'1.0','name':'Web 服务派生 shell 或下载工具','severity':'high','sources':['process'],'condition':'Web/API 容器内，已登记的 Web 服务进程派生 shell 或下载工具','falsePositive':'镜像启动脚本','mode':'alert','limitation':'sandbox 角色不触发；父进程不可见时可信度为 inferred，不记为已观察'}]
+def rule_layer(rule):
+ if rule in ('S02','S03','S13','S14','S15','S16','P01'):return 'D'
+ return 'B'
+def _related_alerts(c,aid,chain_id,agent_id,window,rules=None):
+ if chain_id:
+  rows=c.execute("SELECT payload FROM alerts WHERE id!=? AND json_extract(payload,'$.chainId')=? ORDER BY time DESC LIMIT 20",(aid,chain_id))
+ elif agent_id and window:
+  marks=','.join('?' for _ in rules)
+  rows=c.execute("SELECT payload FROM alerts WHERE id!=? AND rule IN ("+marks+") AND json_extract(payload,'$.agentId')=? AND time BETWEEN ? AND ? ORDER BY time DESC LIMIT 20",(aid,*rules,agent_id,window[0],window[1]))
+ else:return []
+ items=[]
+ for row in rows:
+  item=json.loads(row[0])
+  items.append({k:item.get(k) for k in ('id','rule','title','severity','status','phase','agentId','layer','chainId','createdAt','relation')})
+ return items
 for _rule in RULES:
  if _rule['id']=='P01':
   continue
@@ -123,6 +148,10 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
   rel={'strength':relation,'basis':basis}
   if confidence or relation=='explicit':rel['confidence']=confidence or 'observed'
   value={'id':aid,'aggregateKey':aggregate,'count':1,'firstSeen':e['time'],'lastSeen':e['time'],'sampleEventIds':[e['id']],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'pending' if gate_id else 'open','revision':1,'source':e['source'],'workload':e['workload'],'runId':e.get('runId'),'agentId':e.get('agentId'),'sessionId':e.get('sessionId'),'gateId':gate_id,'relation':rel,'evidence':refs,'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
+  if e.get('chainId'):value['chainId']=e.get('chainId')
+  if e.get('toolCallId'):value['toolCallId']=e.get('toolCallId')
+  value['layer']=rule_layer(rule)
+  if e.get('secretFindings'):value['secretFindings']=[{'category':x.get('category'),'digest':x.get('digest')} for x in e['secretFindings'][:16] if isinstance(x,dict) and x.get('category') and x.get('digest')]
   if e.get('sha256Before') or e.get('sha256After'):value['fileDigest']={'before':e.get('sha256Before'),'after':e.get('sha256After'),'size':e.get('size')}
   c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],value['status'],key,compact(value)));return aid
  def ingest(self,source,items):
@@ -135,9 +164,23 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    for index,item in enumerate(items):
     try:
      if not isinstance(item,dict):raise ValueError('事件必须为对象')
+     if (item.get('kind')=='tool' or item.get('operation')=='TOOL_CALL') and not item.get('secretFindings'):
+      raw_args=item.get('arguments')
+      if raw_args is None and isinstance(item.get('function'),dict):raw_args=item['function'].get('arguments')
+      if isinstance(raw_args,(str,dict,list)) and raw_args!='':
+       text=raw_args if isinstance(raw_args,str) else json.dumps(raw_args,ensure_ascii=False)
+       found=secret_findings(text)
+       if found:item['secretFindings']=found
      e=clean(item)
+     if e.get('kind')=='http':
+      e['clients']=[x for x in (e.get('clients') or []) if isinstance(x,dict)][:64]
+      for client in e['clients']:
+       for drop in ('path','paths','uri','query','ua'):client.pop(drop,None)
+      e['categoryHits']=[x for x in (e.get('categoryHits') or []) if isinstance(x,dict)][:32]
+      for hit in e['categoryHits']:
+       for drop in ('path','uri','query','ua'):hit.pop(drop,None)
      if e.get('source') not in (None,source):raise ValueError('来源不匹配')
-     if not e.get('id') or len(str(e['id']))>160 or e.get('kind') not in ('process','file','network','tool','model'):raise ValueError('事件字段无效')
+     if not e.get('id') or len(str(e['id']))>160 or e.get('kind') not in ('process','file','network','tool','model','http'):raise ValueError('事件字段无效')
      if not e.get('workload') or not e.get('identity',{}).get('basis'):raise ValueError('必须登记工作负载身份及依据')
      e['source']=source;e['receivedAt']=now;e['time']=float(e.get('time',now))
      if abs(e['time']-now)>72*3600:raise ValueError('超出 72 小时事件留存窗口')
@@ -182,6 +225,9 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
     for m in recent(['model']):
      if e.get('runId') and e.get('runId')==m.get('runId') and m.get('text') is not None and 'untrustedSegments' not in m and cmd and canonical_command(cmd) in canonical_command(m.get('text','')):
       self._alert(c,'S03',e,[m,e],'可疑模型到命令执行链','candidate','任务身份、命令文本与时间窗；不证明提示注入');break
+  try:from runtime.http_rules import detect_extra
+  except ImportError:from http_rules import detect_extra
+  detect_extra(self,c,e)
   try:from runtime.chain_detect import observe
   except ImportError:from chain_detect import observe
   observe(self,c,e)
@@ -212,7 +258,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
   found=self._find_chain_alert(c,rule,e['source'],chain_id,tool_call_id)
   if found:return found
   key=digest(['chain',rule,e['source'],chain_id,tool_call_id or e.get('id')]);aid='al_'+key[:24];coverage=self.coverage(c,e['source'])
-  value={'id':aid,'aggregateKey':key,'count':1,'firstSeen':min(x.get('time',e['time']) for x in refs),'lastSeen':e['time'],'sampleEventIds':[x.get('id') for x in refs if x.get('id')],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'open','revision':1,'source':e['source'],'workload':e.get('workload'),'runId':chain_id,'chainId':chain_id,'toolCallId':tool_call_id,'agentId':anchor.get('agentId') or e.get('agentId'),'sessionId':e.get('sessionId') or anchor.get('sessionId'),'phase':phase,'gateId':None,'relation':{'strength':'candidate','confidence':confidence,'basis':basis,'links':links},'evidence':refs[:6],'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
+  value={'id':aid,'aggregateKey':key,'count':1,'firstSeen':min(x.get('time',e['time']) for x in refs),'lastSeen':e['time'],'sampleEventIds':[x.get('id') for x in refs if x.get('id')],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'open','revision':1,'source':e['source'],'workload':e.get('workload'),'runId':chain_id,'chainId':chain_id,'toolCallId':tool_call_id,'agentId':anchor.get('agentId') or e.get('agentId'),'sessionId':e.get('sessionId') or anchor.get('sessionId'),'phase':phase,'layer':rule_layer(rule),'gateId':None,'relation':{'strength':'candidate','confidence':confidence,'basis':basis,'links':links},'evidence':refs[:6],'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
   c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],'open',key,compact(value)));return aid
  def upgrade_chain_alert(self,c,aid,host,link,basis):
   row=c.execute('SELECT payload FROM alerts WHERE id=?',(aid,)).fetchone()
@@ -337,6 +383,10 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    if not r:raise KeyError('告警不存在')
    a=json.loads(r[0]);a['coverageNow']=self.coverage(c,a['source']);a['reviews']=[json.loads(x[0]) for x in c.execute('SELECT payload FROM reviews WHERE alert_id=? ORDER BY time',(aid,))]
    if a.get('gateId'):a['gate']=json.loads(c.execute('SELECT payload FROM gates WHERE id=?',(a['gateId'],)).fetchone()[0])
+   a['chainAlerts']=_related_alerts(c,aid,a.get('chainId'),None,None)
+   start=float(a.get('firstSeen') or a.get('createdAt') or 0)-120;end=float(a.get('lastSeen') or a.get('createdAt') or 0)+120
+   a['nearbyHttp']=_related_alerts(c,aid,None,a.get('agentId'),(start,end),rules=('S17','S18','S19','S21'))
+   for item in a['nearbyHttp']:item['association']='inferred'
    return a
  def listing(self,q):
   with self.db(write=False) as c:
@@ -344,6 +394,9 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    for key in ('rule','severity','status'):
     v=q.get(key,[''])[0]
     if v:where.append(key+'=?');params.append(v)
+   for key in ('chainId','agentId','layer'):
+    v=str(q.get(key,[''])[0] or '')
+    if v:where.append("json_extract(payload,'$."+key+"')=?");params.append(v)
    query=q.get('q',[''])[0]
    if query:where.append('payload LIKE ?');params.append('%'+query.replace('%','\\%').replace('_','\\_')+'%');where[-1]+=" ESCAPE '\\'"
    sql=' WHERE '+' AND '.join(where) if where else '';total=c.execute('SELECT count(*) FROM alerts'+sql,params).fetchone()[0];offset=max(0,int(q.get('offset',['0'])[0]));limit=min(100,max(1,int(q.get('limit',['30'])[0])))
@@ -351,7 +404,10 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    for a in items:a.pop('evidence',None);a.pop('ruleSnapshot',None)
    stats={r['status']:r['n'] for r in c.execute("SELECT status,count(*) n FROM alerts WHERE status!='merged' GROUP BY status")};sources=[self.coverage(c,r[0]) for r in c.execute('SELECT id FROM sources')]
    kept=int(self.config.get('maxEvents',20000))
-   return {'items':items,'total':total,'offset':offset,'limit':limit,'stats':stats,'sources':sources,'serverTime':self.clock(),'capabilities':{'kernelBlock':False,'gate':'REA analyze + fixed-scope lab executor only','retention':'raw 72h/%d; alerts 30d/2000; 256MiB SQLite pages'%kept,'webLens':'candidate import only; no automatic FOFA queries'}}
+   result={'items':items,'total':total,'offset':offset,'limit':limit,'stats':stats,'sources':sources,'serverTime':self.clock(),'capabilities':{'kernelBlock':False,'gate':'REA analyze + fixed-scope lab executor only','retention':'raw 72h/%d; alerts 30d/2000; 256MiB SQLite pages'%kept,'webLens':'candidate import only; no automatic FOFA queries'}}
+   group={'chain':'chainId','agent':'agentId','layer':'layer'}.get(str(q.get('group',[''])[0] or ''))
+   if group:result['groups']=[{'key':r[0] or '','count':r[1]} for r in c.execute("SELECT json_extract(payload,'$."+group+"') k,count(*) n FROM alerts"+sql+' GROUP BY k ORDER BY n DESC LIMIT 500',params)]
+   return result
  def intelligence(self):
   with self.db(write=False) as c:return [json.loads(x[0]) for x in c.execute('SELECT payload FROM intel ORDER BY time DESC LIMIT 50')]
  def intel_accept(self,iid,body,actor):
