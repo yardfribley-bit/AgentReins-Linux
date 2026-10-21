@@ -1,23 +1,30 @@
 """Bounded persistent detection and approvals. No commands are executed here."""
 import contextlib,copy,hashlib,hmac,ipaddress,json,re,sqlite3,time,uuid,fnmatch,shlex
 from pathlib import Path
+try:
+ from runtime.redact import redact_text
+except ImportError:
+ from redact import redact_text
 
 RULES=[
  {'id':'S01','version':'1.0','name':'敏感凭据路径访问','severity':'high','sources':['file'],'condition':'已登记工作负载成功以读取权限打开敏感路径，或尝试访问被拒绝','falsePositive':'部署与密钥轮换可能合法；按工作负载、路径、动作和期限加白','mode':'alert','limitation':'读取权限打开不证明读取了文件正文；不采集凭据内容'},
- {'id':'S02','version':'1.0','name':'工具后的非白名单外联','severity':'medium','sources':['tool','network'],'condition':'同一任务/执行身份的工具调用后，出现允许范围外连接','falsePositive':'模型 API、DNS、依赖安装及代理需要独立配置','mode':'alert','limitation':'只有时间邻近时不触发；candidate 只告警，不自动阻断'},
- {'id':'S03','version':'1.0','name':'可疑模型到命令执行链','severity':'medium','sources':['model','process'],'condition':'明确任务内模型输出的命令与后续执行相符且含高风险模式','falsePositive':'用户可能明确授权；这不单独证明提示注入','mode':'alert','limitation':'命令文本匹配为 candidate；不自动阻断'},
+ {'id':'S02','version':'1.0','name':'工具后的非白名单外联','severity':'medium','sources':['tool','network'],'condition':'同一链路中不受信输入后的高风险工具调用，按目的实体关联到允许范围外的连接','falsePositive':'模型 API、DNS、依赖安装及代理需要写入 allowedNetworks','mode':'alert','limitation':'必须先有不受信片段，并且连接目的与工具参数实体一致；只有时间邻近不触发；不自动阻断'},
+ {'id':'S03','version':'1.0','name':'可疑模型到命令执行链','severity':'medium','sources':['model','tool','process','file','network'],'condition':'不受信输入之后出现高风险工具调用；主机侧按同一 agent 的参数实体确认落地','falsePositive':'用户直接指令或模型自行提议的授权内操作不应命中；这不证明提示注入','mode':'alert','limitation':'不解析提示词语义；语义段先告警，主机段只在精确实体匹配后升级同一条告警；不自动阻断'},
  {'id':'S04','version':'1.0','name':'下载文件后执行','severity':'high','sources':['process','network','file'],'condition':'同一工作负载内下载命令指定的落地路径，被后续进程执行','falsePositive':'合法安装/更新也会命中，必须审阅来源与任务','mode':'alert','limitation':'shell 启动本身不触发；下载/执行按路径与工作负载形成 candidate'},
  {'id':'S05','version':'1.0','name':'授权范围外连接','severity':'high','sources':['network'],'condition':'配置非空网络授权范围的工作负载连接未获允许的目的 IP/端口','falsePositive':'需包含 DNS、模型服务、CDN 与代理实际路径','mode':'alert','limitation':'未配置时不启用；连接尝试不等于已外传数据'},
- {'id':'P01','version':'1.0','name':'已接入工具执行前审批','severity':'medium','sources':['tool'],'condition':'受保护执行器即将执行一个具体调用','falsePositive':'审批请求不是危险行为已发生；这是显式工具保护策略','mode':'require_approval','limitation':'仅保护已接入的 REA analyze 与固定范围实验执行器，不覆盖任意 Dify 工具'}]
+ {'id':'P01','version':'1.0','name':'已接入工具执行前审批','severity':'medium','sources':['tool'],'condition':'受保护执行器即将执行一个具体调用','falsePositive':'审批请求不是危险行为已发生；这是显式工具保护策略','mode':'require_approval','limitation':'仅保护已接入的 REA analyze 与固定范围实验执行器，不覆盖任意 Dify 工具'},
+ {'id':'S08','version':'1.0','name':'敏感文件被修改','severity':'high','sources':['file'],'condition':'已登记工作负载写入敏感凭据或持久化路径','falsePositive':'密钥轮换、软件包安装和用户 shell 配置更新可能合法','mode':'alert','limitation':'只告警，不阻断、不回滚；敏感文件只保留哈希和大小，不保留正文；volume 与 bind mount 不在容器 upperdir 中'}]
 for _rule in RULES:
- if _rule['id']!='P01':_rule['version']='1.1'
+ if _rule['id']=='P01':
+  continue
+ _rule['version']='1.2' if _rule['id'] in ('S02','S03','S08') else '1.1'
 TERMINAL={'denied','expired','cancelled','succeeded','failed','interrupted'}
 def compact(v):return json.dumps(v,ensure_ascii=False,sort_keys=True,separators=(',',':'))
 def digest(v):return hashlib.sha256(compact(v).encode()).hexdigest()
 def clean(v):
  if isinstance(v,dict):return {str(k):('[REDACTED]' if re.search(r'(?i)^(authorization|api[_-]?key|password|token|secret|cookie)$',str(k)) else clean(x)) for k,x in v.items()}
  if isinstance(v,list):return [clean(x) for x in v[:100]]
- if isinstance(v,str):return re.sub(r'(?i)(Bearer\s+|(?:password|api[_-]?key|token|secret)\s*[=:]\s*)[^\s"\']+',r'\1[REDACTED]',v[:16000])
+ if isinstance(v,str):return redact_text(v)
  return v
 class Conflict(ValueError):pass
 class Store:
@@ -71,7 +78,17 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
   window=max(60,min(3600,int(self.config.get('lossWindowSeconds',900))))
   recent=c.execute('SELECT coalesce(sum(audit),0),coalesce(sum(sensor),0) FROM coverage_losses WHERE source=? AND time>?',(source,now-window)).fetchone()
   recent_audit,recent_sensor=recent[0],recent[1];degraded=bool(recent_audit or recent_sensor or counters.get('backpressure',0))
-  return {**body,'state':('degraded' if degraded else 'online') if fresh else 'offline','auditLost':audit,'sensorLoss':loss,'degraded':degraded,'lossWindowSeconds':window,'recentLoss':{'audit':recent_audit if audit is not None else None,'sensor':recent_sensor,'total':recent_audit+recent_sensor if audit is not None else None},'historicalLoss':{'audit':audit,'sensor':loss},'lossWarning':'近期检测窗口有丢失、拒绝或背压' if degraded else None,'ageSeconds':round(now-row['seen'],1),'gaps':gaps,'drop':(int(audit)+loss) if audit is not None else None,'limitations':['近期未增长不代表历史没有缺口；累计损失单独展示','工作目录来自 audit 或执行时 /proc；短命进程可能无法补采']}
+  layers=self._overlay_layers(c,source,body.get('layers'))
+  return {**body,'layers':layers,'state':('degraded' if degraded else 'online') if fresh else 'offline','auditLost':audit,'sensorLoss':loss,'degraded':degraded,'lossWindowSeconds':window,'recentLoss':{'audit':recent_audit if audit is not None else None,'sensor':recent_sensor,'total':recent_audit+recent_sensor if audit is not None else None},'historicalLoss':{'audit':audit,'sensor':loss},'lossWarning':'近期检测窗口有丢失、拒绝或背压' if degraded else None,'ageSeconds':round(now-row['seen'],1),'gaps':gaps,'drop':(int(audit)+loss) if audit is not None else None,'limitations':['近期未增长不代表历史没有缺口；累计损失单独展示','工作目录来自 audit 或执行时 /proc；短命进程可能无法补采','S02/S03 主机段只在同一 agent 的参数实体对齐后升级；Dify bridge 不是触发源']}
+ def _overlay_layers(self,c,source,layers):
+  layers=dict(layers or {});now=self.clock()
+  rows=c.execute("SELECT payload FROM alerts WHERE rule IN ('S02','S03') AND time>?",(now-86400,)).fetchall()
+  for row in rows:
+   alert=json.loads(row[0])
+   seen=float(alert.get('hostConfirmedAt') or alert.get('lastSeen') or 0)
+   if alert.get('source')==source and alert.get('phase')=='host_confirmed' and seen>=now-300:
+    layers['tool']='host_linked';break
+  return layers
 
  def source_fresh(self,c,source):
   r=c.execute('SELECT seen FROM sources WHERE id=?',(source,)).fetchone();return r and self.clock()-r['seen']<35
@@ -80,7 +97,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    x=json.loads(r[0]);scope=x['scope']
    if x.get('rule')==rule and all(str(e.get(k,''))==str(v) for k,v in scope.items()):return True
   return False
- def _alert(self,c,rule,e,refs,title,relation='explicit',basis='工作负载身份与直接主机事件',gate_id=None):
+ def _alert(self,c,rule,e,refs,title,relation='explicit',basis='工作负载身份与直接主机事件',gate_id=None,confidence=None):
   spec=next(r for r in RULES if r['id']==rule)
   if self._suppressed(c,e,rule):return None
   now=self.clock()
@@ -96,7 +113,10 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
     if existing.get('aggregateKey')==aggregate and e['id'] in existing.get('sampleEventIds',[]):return old['id']
   else:aggregate=None
   key=digest([rule,e['source'],e['id'],gate_id]);aid='al_'+key[:24];coverage=self.coverage(c,e['source'])
-  value={'id':aid,'aggregateKey':aggregate,'count':1,'firstSeen':e['time'],'lastSeen':e['time'],'sampleEventIds':[e['id']],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'pending' if gate_id else 'open','revision':1,'source':e['source'],'workload':e['workload'],'runId':e.get('runId'),'gateId':gate_id,'relation':{'strength':relation,'basis':basis},'evidence':refs,'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
+  rel={'strength':relation,'basis':basis}
+  if confidence or relation=='explicit':rel['confidence']=confidence or 'observed'
+  value={'id':aid,'aggregateKey':aggregate,'count':1,'firstSeen':e['time'],'lastSeen':e['time'],'sampleEventIds':[e['id']],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'pending' if gate_id else 'open','revision':1,'source':e['source'],'workload':e['workload'],'runId':e.get('runId'),'agentId':e.get('agentId'),'sessionId':e.get('sessionId'),'gateId':gate_id,'relation':rel,'evidence':refs,'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
+  if e.get('sha256Before') or e.get('sha256After'):value['fileDigest']={'before':e.get('sha256Before'),'after':e.get('sha256After'),'size':e.get('size')}
   c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],value['status'],key,compact(value)));return aid
  def ingest(self,source,items):
   if not isinstance(items,list):raise ValueError('events 必须为数组')
@@ -114,6 +134,10 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
      if not e.get('workload') or not e.get('identity',{}).get('basis'):raise ValueError('必须登记工作负载身份及依据')
      e['source']=source;e['receivedAt']=now;e['time']=float(e.get('time',now))
      if abs(e['time']-now)>72*3600:raise ValueError('超出 72 小时事件留存窗口')
+     if e.get('kind') in ('model','tool'):
+      try:from runtime.semantic_extract import bound_event
+      except ImportError:from semantic_extract import bound_event
+      e=bound_event(e)
      valid.append(e)
     except (ValueError,TypeError,AttributeError):rejected.append({'index':index,'reason':'事件字段、身份或时间无效'})
    for e in sorted(valid,key=lambda x:x['time']):
@@ -125,6 +149,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    for item in valid:
     if item.get('downloadPath'):
      for rr in c.execute('SELECT payload FROM events WHERE source=? AND workload=? AND kind=? AND time BETWEEN ? AND ? ORDER BY time LIMIT 100',(source,item['workload'],'process',float(item.get('time',now)),float(item.get('time',now))+120)).fetchall():self.detect(c,json.loads(rr[0]))
+    self._recompute(c,item)
    self.prune(c)
   return added
  def detect(self,c,e):
@@ -137,9 +162,8 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    allowed=policy.get('allowedNetworks');enabled=isinstance(allowed,list) and len(allowed)>0
    if enabled and not network_allowed(e['destination'],e.get('port'),allowed):
     self._alert(c,'S05',e,row,'授权范围外连接尝试：'+e['destination']+':'+str(e.get('port','')))
-    for t in recent(['tool']):
-     if e.get('runId') and e.get('runId')==t.get('runId'):
-      self._alert(c,'S02',e,[t,e],'工具后的非白名单外联','candidate','相同已登记任务身份与时间窗口；不代表工具唯一导致');break
+  if kind=='file' and e.get('pid',0)>0 and str(e.get('access')) in ('write','metadata_or_write','write_open') and (sensitive_path(path,self.config.get('sensitivePaths')) or persistence_path(path,self.config.get('persistencePaths'))):
+   self._alert(c,'S08',e,row,('敏感或持久化路径写入被拒绝：' if success=='denied' else '敏感或持久化路径被修改：')+path,'explicit','audit 写入事件带有进程与已登记工作负载；只告警，不回滚')
   if kind=='process' and e.get('result') in ('success','attempt'):
    # Joining requires a concrete downloaded output path, not just starting a shell.
    for d in recent(['process']):
@@ -149,11 +173,70 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
      self._alert(c,'S04',e,[d,e],'下载文件后执行：'+output,'candidate','相同工作负载、下载输出路径与执行参数匹配');break
    if risky_command(cmd):
     for m in recent(['model']):
-     if e.get('runId') and e.get('runId')==m.get('runId') and cmd and canonical_command(cmd) in canonical_command(m.get('text','')):
+     if e.get('runId') and e.get('runId')==m.get('runId') and m.get('text') is not None and 'untrustedSegments' not in m and cmd and canonical_command(cmd) in canonical_command(m.get('text','')):
       self._alert(c,'S03',e,[m,e],'可疑模型到命令执行链','candidate','任务身份、命令文本与时间窗；不证明提示注入');break
+  try:from runtime.chain_detect import observe
+  except ImportError:from chain_detect import observe
+  observe(self,c,e)
+ def _recompute(self,c,item):
+  if item.get('kind') not in ('model','tool','process','network','file'):return
+  seen=set()
+  def run(other):
+   if not other.get('id') or other.get('id') in seen or other.get('id')==item.get('id'):return
+   seen.add(other.get('id'))
+   if item.get('agentId') and other.get('agentId') and item['agentId']!=other['agentId']:return
+   if not item.get('agentId') and not item.get('chainId') and other.get('workload')!=item.get('workload'):return
+   self.detect(c,other)
+  start,end=float(item['time'])-120,float(item['time'])+120
+  for rr in c.execute('SELECT payload FROM events WHERE source=? AND time>=? AND time<=? ORDER BY time LIMIT 200',(item['source'],start,end)).fetchall():
+   run(json.loads(rr[0]))
+  chain=item.get('chainId')
+  if not chain:return
+  lo,hi=float(item['time'])-3600,float(item['time'])+120
+  for rr in c.execute('SELECT payload FROM events WHERE source=? AND time>=? AND time<=? ORDER BY time LIMIT 200',(item['source'],lo,hi)).fetchall():
+   other=json.loads(rr[0])
+   if other.get('chainId')==chain and other.get('operation')=='TOOL_CALL':run(other)
+ def open_chain_alert(self,c,rule,e,refs,title,phase,confidence,basis,links,chain_id=None,tool_call_id=None,agent_event=None):
+  spec=next(r for r in RULES if r['id']==rule)
+  anchor=agent_event or e
+  chain_id=chain_id or anchor.get('chainId') or e.get('chainId')
+  tool_call_id=anchor.get('toolCallId') if tool_call_id is None else tool_call_id
+  if not chain_id or self._suppressed(c,e,rule):return None
+  found=self._find_chain_alert(c,rule,e['source'],chain_id,tool_call_id)
+  if found:return found
+  key=digest(['chain',rule,e['source'],chain_id,tool_call_id or e.get('id')]);aid='al_'+key[:24];coverage=self.coverage(c,e['source'])
+  value={'id':aid,'aggregateKey':key,'count':1,'firstSeen':min(x.get('time',e['time']) for x in refs),'lastSeen':e['time'],'sampleEventIds':[x.get('id') for x in refs if x.get('id')],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'open','revision':1,'source':e['source'],'workload':e.get('workload'),'runId':chain_id,'chainId':chain_id,'toolCallId':tool_call_id,'agentId':anchor.get('agentId') or e.get('agentId'),'sessionId':e.get('sessionId') or anchor.get('sessionId'),'phase':phase,'gateId':None,'relation':{'strength':'candidate','confidence':confidence,'basis':basis,'links':links},'evidence':refs[:6],'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
+  c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],'open',key,compact(value)));return aid
+ def upgrade_chain_alert(self,c,aid,host,link,basis):
+  row=c.execute('SELECT payload FROM alerts WHERE id=?',(aid,)).fetchone()
+  if not row:return None
+  alert=json.loads(row['payload']);ids=list(alert.get('sampleEventIds') or []);changed=False
+  copy=dict(host);copy.update(chainId=alert.get('chainId'),toolCallId=alert.get('toolCallId'),linkConfidence='correlated',linkBasis=link.get('basis'))
+  if host.get('id') not in ids:
+   alert['sampleEventIds']=(ids+[host.get('id')])[-1000:];alert['count']=alert.get('count',1)+1;alert['lastSeen']=max(alert.get('lastSeen',0),host.get('time',0))
+   if len(alert.get('evidence') or [])<6:alert.setdefault('evidence',[]).append(copy)
+   alert.setdefault('relation',{}).setdefault('links',[]).append(link);changed=True
+  if alert.get('phase')!='host_confirmed':
+   alert['phase']='host_confirmed';alert['hostConfirmedAt']=host.get('time');alert['relation']['confidence']='correlated';alert['relation']['basis']=basis;changed=True
+   if alert.get('sessionId') is None and host.get('sessionId'):alert['sessionId']=host.get('sessionId')
+  if not changed:return aid
+  alert['revision']=alert.get('revision',1)+1;c.execute('UPDATE alerts SET payload=? WHERE id=?',(compact(alert),aid));return aid
+ def _find_chain_alert(self,c,rule,source,chain_id,tool_call_id):
+  if not chain_id:return None
+  for row in c.execute('SELECT id,payload FROM alerts WHERE rule=? AND time>? ORDER BY time DESC LIMIT 300',(rule,self.clock()-7*86400)).fetchall():
+   payload=json.loads(row['payload'])
+   if payload.get('source')!=source or payload.get('chainId')!=chain_id:continue
+   if tool_call_id and payload.get('toolCallId') and payload.get('toolCallId')!=tool_call_id:continue
+   return row['id']
+  return None
  def prune(self,c):
-  now=self.clock()
-  c.execute('DELETE FROM events WHERE time<?',(now-72*3600,));c.execute('DELETE FROM events WHERE rowid IN (SELECT rowid FROM events ORDER BY time DESC LIMIT -1 OFFSET 20000)')
+  now=self.clock();limit=max(1000,min(2000000,int(self.config.get('maxEvents',20000))))
+  c.execute('DELETE FROM events WHERE time<?',(now-72*3600,));c.execute('DELETE FROM events WHERE rowid IN (SELECT rowid FROM events ORDER BY time DESC LIMIT -1 OFFSET ?)',(limit,))
+  per=self.config.get('maxEventsPerSource')
+  if per:
+   per=max(100,min(2000000,int(per)))
+   for (source,) in c.execute('SELECT DISTINCT source FROM events').fetchall():
+    c.execute('DELETE FROM events WHERE source=? AND rowid IN (SELECT rowid FROM events WHERE source=? ORDER BY time DESC LIMIT -1 OFFSET ?)',(source,source,per))
   c.execute('DELETE FROM reviews WHERE time<?',(now-30*86400,));c.execute('DELETE FROM alerts WHERE time<? AND status!=?',(now-30*86400,'pending'));c.execute('DELETE FROM alerts WHERE rowid IN (SELECT rowid FROM alerts WHERE status!=? ORDER BY time DESC LIMIT -1 OFFSET 2000)',('pending',))
   c.execute('DELETE FROM exceptions WHERE expires<?',(now,));c.execute('DELETE FROM gaps WHERE start<?',(now-30*86400,))
   # Decisions survive restart; executing grants are never replayed automatically.
@@ -260,7 +343,8 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    items=[json.loads(r[0]) for r in c.execute('SELECT payload FROM alerts'+sql+' ORDER BY time DESC LIMIT ? OFFSET ?',(*params,limit,offset))]
    for a in items:a.pop('evidence',None);a.pop('ruleSnapshot',None)
    stats={r['status']:r['n'] for r in c.execute("SELECT status,count(*) n FROM alerts WHERE status!='merged' GROUP BY status")};sources=[self.coverage(c,r[0]) for r in c.execute('SELECT id FROM sources')]
-   return {'items':items,'total':total,'offset':offset,'limit':limit,'stats':stats,'sources':sources,'serverTime':self.clock(),'capabilities':{'kernelBlock':False,'gate':'REA analyze + fixed-scope lab executor only','retention':'raw 72h/20000; alerts 30d/2000; 256MiB SQLite pages','webLens':'candidate import only; no automatic FOFA queries'}}
+   kept=int(self.config.get('maxEvents',20000))
+   return {'items':items,'total':total,'offset':offset,'limit':limit,'stats':stats,'sources':sources,'serverTime':self.clock(),'capabilities':{'kernelBlock':False,'gate':'REA analyze + fixed-scope lab executor only','retention':'raw 72h/%d; alerts 30d/2000; 256MiB SQLite pages'%kept,'webLens':'candidate import only; no automatic FOFA queries'}}
  def intelligence(self):
   with self.db(write=False) as c:return [json.loads(x[0]) for x in c.execute('SELECT payload FROM intel ORDER BY time DESC LIMIT 50')]
  def intel_accept(self,iid,body,actor):
@@ -297,9 +381,19 @@ SENSITIVE_PATHS={
  'aws':['*/.aws/credentials','*/.aws/config'], 'gcloud':['*/.config/gcloud/application_default_credentials.json'],
  'azure':['*/.azure/accessTokens.json','*/.azure/msal_token_cache*'],
  'key':['*.pem','*.key'], 'secrets':['*/secrets.yaml','*/secrets.yml','*/secrets.json']}
+PERSISTENCE_PATHS={
+ 'env':['*/.env','*/.env.*'],'ssh':['*/.ssh/authorized_keys','*/.ssh/authorized_keys2'],
+ 'shell':['*/.bashrc','*/.profile','*/.bash_profile','*/.zshrc'],
+ 'cron':['/etc/crontab','/etc/cron.d/*','/etc/cron.daily/*','/etc/cron.hourly/*','/var/spool/cron/*','/var/spool/cron/crontabs/*'],
+ 'systemd':['/etc/systemd/system/*','*/.config/systemd/user/*'],'preload':['/etc/ld.so.preload'],
+ 'git':['*/.git/hooks/*'],'workflow':['*/.github/workflows/*'],
+ 'account':['/etc/passwd','/etc/group','/etc/sudoers','/etc/sudoers.d/*']}
 def sensitive_path(path,patterns=None):
  groups=patterns if isinstance(patterns,dict) else SENSITIVE_PATHS
  return any(fnmatch.fnmatchcase(path,p) for ps in groups.values() for p in ps)
+def persistence_path(path,patterns=None):
+ groups=patterns if isinstance(patterns,dict) else PERSISTENCE_PATHS
+ return any(fnmatch.fnmatchcase(path or '',p) for ps in groups.values() for p in ps)
 def canonical_command(s):
  try:return ' '.join(shlex.split(s))
  except ValueError:return ' '.join(s.split())

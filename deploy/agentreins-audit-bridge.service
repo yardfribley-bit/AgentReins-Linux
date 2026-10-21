@@ -4,6 +4,8 @@ After=auditd.service
 Requires=auditd.service
 
 [Service]
+Environment=PYTHONPATH=/opt/agentreins-runtime
+Environment=AGENTREINS_RUNTIME=/opt/agentreins-runtime
 ExecStart=/usr/bin/python3 /opt/agentreins/audit_bridge.py
 Restart=on-failure
 RestartSec=3

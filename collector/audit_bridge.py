@@ -2,12 +2,14 @@
 """Normalize Linux audit records into the existing AgentReins evidence stream."""
 from activity_policy import policy as persistence_policy
 import collections
+import sys
 import datetime
 import hashlib
 import ipaddress
 import json
 import os
 import re
+import shlex
 import socket
 import time
 
@@ -26,10 +28,22 @@ def decode(value):
     return value
 
 def redact(value):
-    value = re.sub(r'(?i)((?:password|passwd|token|secret|api[_-]?key|cookie)\s*[=:]\s*)[^\s"\']+', r'\1[REDACTED]', value)
-    value = re.sub(r'(?i)(--(?:password|passwd|token|secret|api[_-]?key)\s+)\S+', r'\1[REDACTED]', value)
-    value = re.sub(r'(?i)(Authorization:\s*(?:Bearer|Basic)\s+)\S+', r'\1[REDACTED]', value)
-    return re.sub(r'(https?://[^\s/:]+:)[^@/\s]+@', r'\1[REDACTED]@', value)
+    try:
+        from runtime.redact import redact_text
+    except ImportError:
+        sys_path = os.environ.get('AGENTREINS_RUNTIME', '/opt/agentreins-runtime')
+        if sys_path not in sys.path:
+            sys.path.insert(0, sys_path)
+        try:
+            from redact import redact_text
+        except ImportError:
+            value = re.sub(r'(?i)((?:password|passwd|token|secret|api[_-]?key|cookie)\s*[=:]\s*)[^\s"\']+', r'\1[REDACTED]', value)
+            value = re.sub(r'(?i)(--(?:password|passwd|token|secret|api[_-]?key|with-token)(?:\s+|=))[^\s"\']+', r'\1[REDACTED]', value)
+            value = re.sub(r'(?i)(Authorization:\s*(?:Bearer|Basic)\s+)[^\s"\']+', r'\1[REDACTED]', value)
+            value = re.sub(r'(?i)(-u\s+[^\s:]+:)[^\s"\']+', r'\1[REDACTED]', value)
+            value = re.sub(r'(?i)([A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)[^\s"\']+', r'\1[REDACTED]', value)
+            return re.sub(r'(https?://[^\s/:"\']+:)[^@/\s"\']+@', r'\1[REDACTED]@', value)
+    return redact_text(value)
 
 def identity(pid):
     try:
@@ -83,10 +97,14 @@ def emit(timestamp, serial, records):
                     if match:
                         fragments[int(match[1])][int(match[2])] = decode(v)
         if kind == 'PROCTITLE':
-            proctitle = decode(fields.get('proctitle', '')).replace('\0', ' ')
+            proctitle = decode(fields.get('proctitle', ''))
     for index, parts in fragments.items():
         arguments[index] = ''.join(part for _,part in sorted(parts.items()))
-    cmd = ' '.join(value for _,value in sorted(arguments.items())) or proctitle
+    argv = [value for _, value in sorted(arguments.items())]
+    if argv:
+        cmd = shlex.join(argv)
+    else:
+        cmd = shlex.join(part for part in proctitle.split('\0') if part)
     resource = redact(cmd or decode(call.get('exe', '')))
     category, operation = 'kernel', 'AUDIT_EXEC'
     extra = {'syscall': call.get('syscall'), 'arch': call.get('arch'), 'uid': call.get('uid'), 'auid': call.get('auid'), 'exit': call.get('exit'), 'auditSerial': serial, **ident}
@@ -103,7 +121,7 @@ def emit(timestamp, serial, records):
     elif key == 'agentreins_sandbox':
         category, operation = 'sandbox', 'AUDIT_BOUNDARY'
         extra['arguments'] = {k: call[k] for k in ('a0','a1','a2','a3') if k in call}
-    elif key in ('agentreins_files', 'agentreins_sensitive'):
+    elif key in ('agentreins_files', 'agentreins_sensitive', 'agentreins_persist'):
         category, operation = 'kernel', 'AUDIT_FILE'
         paths = [decode(f.get('name','')) for t,f in records if t == 'PATH' and decode(f.get('name','')) not in ('(null)', '')]
         resource = ', '.join(paths)

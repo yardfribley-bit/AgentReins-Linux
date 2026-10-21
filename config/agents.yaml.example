@@ -1,0 +1,31 @@
+# Copy to /etc/agentreins/agents.yaml and replace the documentation ranges
+# (RFC 5737) with this host's docker bridge CIDRs. Do not commit real addresses.
+# Patterns are regular expressions when they contain ".*", otherwise globs.
+# containerPatterns in sensor.json should list the same container names.
+agents:
+  - id: target-01
+    gateway:
+      bind: "127.0.0.1"
+      port: 18901
+      peerAllowlist: ["192.0.2.0/24"]
+    containers:
+      - pattern: "target-01-.*"
+    allowedNetworks:
+      - cidr: "192.0.2.0/24"
+        ports: [80, 443]
+  - id: target-02
+    gateway:
+      bind: "127.0.0.1"
+      port: 18903
+      peerAllowlist: ["192.0.2.0/24"]
+    containers:
+      - pattern: "target-02-.*"
+    allowedNetworks:
+      - cidr: "192.0.2.0/24"
+  - id: attacker-01
+    gateway: {port: 18902, peerAllowlist: ["198.51.100.0/24"]}
+    containers:
+      - pattern: "pentagi-terminal-*"
+      - pattern: "*-pentagi-terminal-*"
+    allowedNetworks:
+      - cidr: "203.0.113.0/24"

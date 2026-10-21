@@ -6,4 +6,8 @@
 -w /etc/passwd -p wa -k agentreins_files
 -w /etc/group -p wa -k agentreins_files
 -w /etc/sudoers -p wa -k agentreins_files
-# Add watches for existing agent data directories on this host.
+# Persistence writes (S08) are installed by runtime/watch_scope.py --apply.
+# That command only adds audit watches for paths that already exist, with
+# -p wa -k agentreins_persist. Do not add missing paths here: auditd refuses
+# the whole file when a watched path is absent. Overlay upperdir changes are
+# collected separately and do not cover volumes or bind mounts.

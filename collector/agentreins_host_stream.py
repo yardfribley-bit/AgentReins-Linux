@@ -30,6 +30,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import socket
 import struct
 import subprocess
@@ -50,10 +51,22 @@ seen: "deque[str]" = deque(maxlen=20000)
 def mask_passwords(text: str) -> str:
     """Keep commands verbatim, redact only values that can authenticate."""
     text = re.sub(r"(?im)^([ \t]*#\s*root\s*\n[ \t]*#\s*)\S+", r"\1******", text)
-    text = re.sub(r"(?i)\b(password|passwd|pwd)(\s*[:=]\s*)(?![$(])([^\s\"']+)", r"\1\2******", text)
-    text = re.sub(r"(?i)(Authorization:\s*(?:Bearer|Basic)\s+)\S+", r"\1******", text)
-    text = re.sub(r"(?i)(https?://[^\s/:]+:)[^@/\s]+@", r"\1******@", text)
-    return text
+    try:
+        from runtime.redact import redact_text
+    except ImportError:
+        runtime = os.environ.get("AGENTREINS_RUNTIME", "/opt/agentreins-runtime")
+        if runtime not in sys.path:
+            sys.path.insert(0, runtime)
+        try:
+            from redact import redact_text
+        except ImportError:
+            text = re.sub(r"(?i)((?:password|passwd|pwd|api[_-]?key|token|secret)\s*[=:]\s*)[^\s\"']+", r"\1[REDACTED]", text)
+            text = re.sub(r"(?i)(--(?:api[_-]?key|token|password|secret|with-token)(?:\s+|=))[^\s\"']+", r"\1[REDACTED]", text)
+            text = re.sub(r"(?i)(Authorization:\s*(?:Bearer|Basic)\s+)[^\s\"']+", r"\1[REDACTED]", text)
+            text = re.sub(r"(?i)(-u\s+[^\s:]+:)[^\s\"']+", r"\1[REDACTED]", text)
+            text = re.sub(r"(?i)([A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)[^\s\"']+", r"\1[REDACTED]", text)
+            return re.sub(r"(https?://[^\s/:\"']+:)[^@/\s\"']+@", r"\1[REDACTED]@", text)
+    return redact_text(text)
 
 
 def event_key(event: dict) -> str:
@@ -76,9 +89,14 @@ def now_iso() -> str:
 
 
 def read_cmdline(pid: int) -> str:
+    """Rebuild argv with quotes so shell redirects survive later parsing."""
     try:
         with open("/proc/%d/cmdline" % pid, "rb") as fh:
-            return fh.read(4096).replace(b"\0", b" ").decode("utf-8", "replace").strip()
+            raw = fh.read(4096)
+        parts = [part.decode("utf-8", "replace") for part in raw.split(b"\0")]
+        while parts and parts[-1] == "":
+            parts.pop()
+        return shlex.join(parts) if parts else ""
     except OSError:
         return ""
 
