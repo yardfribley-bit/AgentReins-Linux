@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from runtime.engine import Store
+from runtime.tool_definitions import tool_hash
 
 SECRET = 'PLACEHOLDERSECRET'
 SRC = '192.0.2.10'
@@ -322,6 +323,186 @@ def case_web_child_inferred():
     return result
 
 
+def _tool_def(name, description='PLACEHOLDER_STATUS', parameters=None):
+    if parameters is None:
+        parameters = {'type': 'object', 'properties': {'q': {'type': 'string'}}}
+    return {'name': name, 'description': description, 'parameters': parameters}
+
+
+def _definitions(agent, when, tools, chain='chain-s23', learn_requests=None, learn_seconds=None, pinned=None, suffix=''):
+    event = {
+        'id': 'defs-%s-%s%s' % (agent, int(when * 1000), suffix),
+        'time': when,
+        'workload': 'gateway:' + agent,
+        'kind': 'model',
+        'operation': 'TOOL_DEFINITIONS',
+        'identity': {'basis': 'gateway route'},
+        'agentId': agent,
+        'chainId': chain,
+        'confidence': 'observed',
+        'pid': 0,
+        'result': 'success',
+        'toolDefinitions': tools,
+    }
+    baseline = {}
+    if learn_requests is not None:
+        baseline['learnRequests'] = learn_requests
+    if learn_seconds is not None:
+        baseline['learnSeconds'] = learn_seconds
+    if pinned is not None:
+        baseline['pinned'] = pinned
+    if baseline:
+        event['toolBaseline'] = baseline
+    return event
+
+
+def _s23(store):
+    return [store.detail(item['id']) for item in store.listing({})['items'] if item['rule'] == 'S23']
+
+
+def _one_s23(result, store, change):
+    alerts = _s23(store)
+    if len(alerts) != 1:
+        result['ok'] = False
+        result['note'] = result['note'] + '; alerts=%d' % len(alerts)
+        return None
+    alert = alerts[0]
+    definition = alert.get('toolDefinition') or {}
+    result['ok'] = (
+        result['ok']
+        and definition.get('change') == change
+        and alert.get('relation', {}).get('confidence') == 'observed'
+        and alert.get('agentId') == 'target-01'
+        and alert.get('chainId') == 'chain-s23'
+        and alert.get('layer') == 'D'
+    )
+    return alert
+
+
+def case_tool_learn():
+    store = _store()
+    when = store.clock.now
+    events = []
+    for index in range(3):
+        tools = [_tool_def('status')]
+        if index == 2:
+            tools.append(_tool_def('lookup'))
+        events.append(_definitions('target-01', when, tools, suffix='-%d' % index))
+    store.ingest('host', events)
+    return _finish('D-5-learn', store, [], 'a new name during the default learning window does not alert')
+
+
+def case_tool_reorder():
+    store = _store()
+    when = store.clock.now
+    first = {'type': 'object', 'properties': {'q': {'type': 'string'}, 'limit': {'type': 'integer'}}}
+    second = {'properties': {'limit': {'type': 'integer'}, 'q': {'type': 'string'}}, 'type': 'object'}
+    store.ingest('host', [
+        _definitions('target-01', when, [_tool_def('status', parameters=first)], suffix='-a', learn_requests=1, learn_seconds=0),
+        _definitions('target-01', when + 1, [_tool_def('status', parameters=second)], suffix='-b', learn_requests=1, learn_seconds=0),
+    ])
+    return _finish('D-5-reorder', store, [], 'JSON key order is not a definition change')
+
+
+def case_tool_pinned_match():
+    store = _store()
+    when = store.clock.now
+    tool = _tool_def('status')
+    pinned = tool_hash(tool['name'], tool['description'], tool['parameters'])
+    store.ingest('host', [_definitions('target-01', when, [tool], pinned={'status': pinned})])
+    return _finish('D-5-pinned-match', store, [], 'a declaration that matches the pinned hash does not alert')
+
+
+def case_tool_new():
+    store = _store()
+    when = store.clock.now
+    store.ingest('host', [
+        _definitions('target-01', when, [_tool_def('status')], suffix='-a', learn_requests=1, learn_seconds=0),
+        _definitions('target-01', when + 1, [_tool_def('status'), _tool_def('lookup')], suffix='-b', learn_requests=1, learn_seconds=0),
+    ])
+    result = _finish('D-5-new', store, ['S23'], 'a name that appears after the baseline')
+    alert = _one_s23(result, store, 'new')
+    if alert:
+        definition = alert['toolDefinition']
+        result['ok'] = result['ok'] and definition.get('toolName') == 'lookup' and definition.get('newHash') and not definition.get('oldHash')
+    return result
+
+
+def case_tool_description():
+    store = _store()
+    when = store.clock.now
+    store.ingest('host', [
+        _definitions('target-01', when, [_tool_def('status')], suffix='-a', learn_requests=1, learn_seconds=0),
+        _definitions('target-01', when + 1, [_tool_def('status', description='PLACEHOLDER_STATUS revised')], suffix='-b', learn_requests=1, learn_seconds=0),
+    ])
+    result = _finish('D-5-description', store, ['S23'], 'a changed description changes the hash')
+    alert = _one_s23(result, store, 'changed')
+    if alert:
+        definition = alert['toolDefinition']
+        result['ok'] = result['ok'] and definition.get('oldHash') and definition.get('newHash') and definition['oldHash'] != definition['newHash']
+        result['ok'] = result['ok'] and 'PLACEHOLDER_STATUS' in definition.get('diff', '') and 'revised' in definition.get('diff', '')
+        result['ok'] = result['ok'] and alert.get('severity') == 'medium'
+    return result
+
+
+def case_tool_schema():
+    store = _store()
+    when = store.clock.now
+    changed = {'type': 'object', 'properties': {'query': {'type': 'string'}}}
+    store.ingest('host', [
+        _definitions('target-01', when, [_tool_def('status')], suffix='-a', learn_requests=1, learn_seconds=0),
+        _definitions('target-01', when + 1, [_tool_def('status', parameters=changed)], suffix='-b', learn_requests=1, learn_seconds=0),
+    ])
+    result = _finish('D-5-schema', store, ['S23'], 'a changed parameter name changes the hash')
+    alert = _one_s23(result, store, 'changed')
+    if alert:
+        diff = alert['toolDefinition'].get('diff') or ''
+        result['ok'] = result['ok'] and 'query' in diff and 'q' in diff and alert['toolDefinition']['oldHash'] != alert['toolDefinition']['newHash']
+    return result
+
+
+def case_tool_hidden():
+    store = _store()
+    when = store.clock.now
+    hidden = 'PLACEHOLDER_STATUS' + '\U000E0041'
+    store.ingest('host', [_definitions('target-01', when, [_tool_def('status', description=hidden)])])
+    result = _finish('D-5-hidden', store, ['S23'], 'a unicode tag in the description alerts during learning')
+    alert = _one_s23(result, store, 'suspicious')
+    if alert:
+        result['ok'] = result['ok'] and 'hidden_unicode' in (alert['toolDefinition'].get('suspicious') or []) and alert.get('severity') == 'medium'
+        result['ok'] = result['ok'] and '\U000E0041' not in _dump(store)
+    return result
+
+
+def case_tool_pinned_mismatch():
+    store = _store()
+    when = store.clock.now
+    store.ingest('host', [_definitions('target-01', when, [_tool_def('status')], pinned={'status': '0' * 64})])
+    result = _finish('D-5-pinned', store, ['S23'], 'a pinned hash wins over the learning window')
+    alert = _one_s23(result, store, 'pinned')
+    if alert:
+        definition = alert['toolDefinition']
+        result['ok'] = result['ok'] and definition.get('oldHash') == '0' * 64 and definition.get('newHash') and definition['newHash'] != definition['oldHash']
+        result['ok'] = result['ok'] and alert.get('severity') == 'medium'
+    return result
+
+
+def case_tool_removed():
+    store = _store()
+    when = store.clock.now
+    store.ingest('host', [
+        _definitions('target-01', when, [_tool_def('status'), _tool_def('lookup')], suffix='-a', learn_requests=1, learn_seconds=0),
+        _definitions('target-01', when + 1, [_tool_def('status')], suffix='-b', learn_requests=1, learn_seconds=0),
+    ])
+    result = _finish('D-5-removed', store, ['S23'], 'a tool that disappears after the baseline is info')
+    alert = _one_s23(result, store, 'removed')
+    if alert:
+        definition = alert['toolDefinition']
+        result['ok'] = result['ok'] and definition.get('toolName') == 'lookup' and definition.get('oldHash') and not definition.get('newHash')
+        result['ok'] = result['ok'] and alert.get('severity') == 'info'
+    return result
+
+
 def case_sandbox_child():
     store = _store()
     when = store.clock.now
@@ -356,6 +537,15 @@ CASES = [
     case_web_child,
     case_web_child_inferred,
     case_sandbox_child,
+    case_tool_learn,
+    case_tool_reorder,
+    case_tool_pinned_match,
+    case_tool_new,
+    case_tool_description,
+    case_tool_schema,
+    case_tool_hidden,
+    case_tool_pinned_mismatch,
+    case_tool_removed,
 ]
 
 

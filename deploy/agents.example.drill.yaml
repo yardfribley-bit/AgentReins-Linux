@@ -1,0 +1,133 @@
+# Drill deployment template. Copy to /etc/agentreins/agents.yaml on the host.
+# Do not commit the filled copy. Every address below is an RFC 5737 placeholder
+# or a .invalid name. Replace those on the host.
+#
+# Rule switches are comments. Uncomment one only after a capture confirms it.
+# Check what is still off:
+#   PYTHONPATH=. python3 scripts/check_config.py --agents /etc/agentreins/agents.yaml --runtime-config /etc/agentreins-runtime/config.json
+# Suggest values from a capture (read-only):
+#   PYTHONPATH=. python3 scripts/derive_config.py --db /var/lib/agentreins-runtime/runtime.sqlite --gateway-log /var/log/agentreins/semantic.jsonl --since <start> --until <end>
+#
+# sensor.json containerPatterns should repeat the container patterns below:
+#   dify-a-api, dify-a-worker, dify-a-web, dify-a-plugin,
+#   dify-b-api, dify-b-worker, dify-b-web, dify-b-plugin,
+#   pentagi-terminal-*, *-pentagi-terminal-*
+#
+# runtime config.json (not this file) — S15 stays off until this object is present.
+# Conservative floor for a short capture: perMinute 30, perChainTool 12.
+# If derive_config.py prints a larger p99 x 3, use that larger number.
+# A quiet window's p99 x 3 can be tighter than this floor; do not lower the floor
+# unless the capture covers a busy hour.
+# toolThresholds: {perMinute: 30, perChainTool: 12}
+agents:
+  - id: dify-a
+    gateway:
+      bind: "127.0.0.1"
+      port: 18901
+      # peerAllowlist: ["192.0.2.0/24"]
+    containers:
+      - pattern: "dify-a-api"
+      - pattern: "dify-a-worker"
+      - pattern: "dify-a-web"
+      - pattern: "dify-a-plugin"
+      # Add role on its own line under a pattern before enabling S20 or S22.
+      # database and cache do not raise S20. sandbox does not raise S22.
+      # - pattern: "dify-a-api"
+      #   role: api
+      # - pattern: "dify-a-worker"
+      #   role: worker
+      # - pattern: "dify-a-web"
+      #   role: web
+    # allowedNetworks:
+    #   - cidr: "192.0.2.0/24"
+    #   - cidr: "198.51.100.0/24"
+    #     ports: [443]
+    # The first range is the docker bridge (TO-FILL). The second is the model
+    # API egress (TO-FILL). S05 matches IP literals, not hostnames.
+    # allowedTools:
+    #   - "status"
+    # Derive the names. Do not guess. A name missing from this list raises S14
+    # once the list is non-empty:
+    # PYTHONPATH=. python3 scripts/derive_config.py --db <runtime.sqlite> --gateway-log <semantic.jsonl>
+    # webServers: ["nginx", "gunicorn", "node"]
+    # Dify's web and api process names. Confirm with the capture before uncommenting.
+    # celery and uvicorn are omitted: S22 alerts when a listed process spawns a
+    # shell or a download tool, and those workers do that during normal jobs.
+    # knowledgeMarkers:
+    #   start: "<context>"
+    #   end: "</context>"
+    # TO-VERIFY. Dify's default chat template wraps retrieved text in
+    # <context>...</context>. Some versions only use a {{context}} variable and
+    # no tags. Compare a captured system prompt before uncommenting. A missing
+    # end marker makes that span confidence unknown and does not raise S02/S03.
+    # toolDefinitionBaseline:
+    #   learnRequests: 10
+    #   learnSeconds: 600
+    #   pinned: {}
+    # S23 is already on with these defaults (10 requests and 10 minutes,
+    # whichever is later). Pin a hash only after the same capture:
+    # pinned: {status: "<sha256 from the gateway TOOL_DEFINITIONS line>"}
+    # internalNetworks: ["192.0.2.0/24"]
+    # hostGateways: ["192.0.2.1"]
+    # inbound:
+    #   vhost: ["dify-a.invalid"]
+    #   port: [8080]
+    #   pathPrefix: ["/"]
+    #   loginPaths: ["/auth/login"]
+  - id: dify-b
+    gateway:
+      bind: "127.0.0.1"
+      port: 18903
+      # peerAllowlist: ["192.0.2.0/24"]
+    containers:
+      - pattern: "dify-b-api"
+      - pattern: "dify-b-worker"
+      - pattern: "dify-b-web"
+      - pattern: "dify-b-plugin"
+    # allowedNetworks:
+    #   - cidr: "192.0.2.0/24"
+    #   - cidr: "198.51.100.0/24"
+    #     ports: [443]
+    # allowedTools:
+    #   - "status"
+    # webServers: ["nginx", "gunicorn", "node"]
+    # knowledgeMarkers:
+    #   start: "<context>"
+    #   end: "</context>"
+    # TO-VERIFY against dify-b's own system prompt. Do not copy dify-a's markers
+    # if the two apps use different templates.
+    # toolDefinitionBaseline:
+    #   learnRequests: 10
+    #   learnSeconds: 600
+    #   pinned: {}
+    # internalNetworks: ["198.51.100.0/24"]
+    # hostGateways: ["192.0.2.1"]
+    # inbound:
+    #   vhost: ["dify-b.invalid"]
+    #   port: [8081]
+    #   pathPrefix: ["/"]
+    #   loginPaths: ["/auth/login"]
+  - id: pentagi
+    gateway:
+      bind: "127.0.0.1"
+      port: 18902
+      # peerAllowlist: ["203.0.113.0/24"]
+    containers:
+      - pattern: "pentagi-terminal-*"
+      - pattern: "*-pentagi-terminal-*"
+    # allowedNetworks:
+    #   - cidr: "203.0.113.0/24"
+    #   - cidr: "198.51.100.0/24"
+    #     ports: [443]
+    # allowedTools:
+    #   - "terminal"
+    # Derive PentAGI's tool names from its own capture. Do not reuse the Dify list.
+    # webServers stays unset. The terminal container is a sandbox, not a web server,
+    # and S22 does not apply to a sandbox role.
+    # knowledgeMarkers stays unset until a PentAGI prompt sample shows a real wrapper.
+    # toolDefinitionBaseline:
+    #   learnRequests: 10
+    #   learnSeconds: 600
+    #   pinned: {}
+    # internalNetworks: ["203.0.113.0/24"]
+    # hostGateways: ["192.0.2.1"]

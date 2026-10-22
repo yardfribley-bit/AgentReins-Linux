@@ -33,6 +33,15 @@ def _imports():
 
 load_agents, peer_allowed, resolve_route, redact_text, secret_findings, ChainBook, content_text, extract_entities, triggering_untrusted, untrusted_segments = _imports()
 
+
+def _summarize_payload(payload):
+    try:
+        from runtime.tool_definitions import summarize_payload
+    except ImportError:
+        sys.path.insert(0, os.environ.get('AGENTREINS_RUNTIME', '/opt/agentreins-runtime'))
+        from tool_definitions import summarize_payload
+    return summarize_payload(payload)
+
 UPSTREAM = os.environ.get('AGENTREINS_UPSTREAM', 'https://api.openai.com/v1').rstrip('/')
 OUT = os.environ.get('AGENTREINS_HOST_LOG', '/var/log/agentreins/host.jsonl')
 SEMANTIC_OUT = os.environ.get('AGENTREINS_SEMANTIC_LOG', '/var/log/agentreins/semantic.jsonl')
@@ -143,6 +152,8 @@ class Gateway:
                     for message in payload.get('messages') or []:
                         if isinstance(message, dict) and message.get('role') == 'tool':
                             self.emit('TOOL_RESULT', rid, {'tool_call_id': message.get('tool_call_id'), 'excerpt': content_text(message.get('content'))[:512]}, peer, evidence=evidence)
+            if request.command == 'POST' and isinstance(payload, dict) and agent is not None:
+                self._emit_definitions(rid, peer, payload, evidence, agent)
             headers = {k: v for k, v in request.headers.items() if k.lower() not in ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')}
             upstream = urllib.request.Request(self.upstream + upstream_path, data=body if request.command == 'POST' else None, headers=headers, method=request.command)
             phase = 'upstream_connect'
@@ -181,6 +192,24 @@ class Gateway:
         if not self.agents:
             return None, None, 'unbound'
         return resolve_route(self.agents, path, port)
+
+    def _emit_definitions(self, rid, peer, payload, evidence, agent):
+        summary = _summarize_payload(payload)
+        if summary is None:
+            return None
+        baseline = (agent or {}).get('toolDefinitionBaseline') or {}
+        extra = dict(evidence)
+        extra['toolDefinitions'] = summary['tools']
+        extra['toolBaseline'] = {
+            'learnRequests': int(baseline.get('learnRequests') or 10),
+            'learnSeconds': int(baseline.get('learnSeconds') or 600),
+            'pinned': dict(baseline.get('pinned') or {}),
+        }
+        return self.emit(
+            'TOOL_DEFINITIONS', rid,
+            {'toolCount': len(summary['tools']), 'names': [item['name'] for item in summary['tools']]},
+            peer, evidence=extra,
+        )
 
     def _request_summary(self, payload, chain_state):
         messages = payload.get('messages') or []

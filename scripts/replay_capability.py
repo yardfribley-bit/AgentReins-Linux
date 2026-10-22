@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay placeholder web and decision cases. Writes summary.json."""
+"""Replay placeholder web, decision, and S23 tool-definition cases. Writes summary.json."""
 import json
 import sys
 from pathlib import Path
