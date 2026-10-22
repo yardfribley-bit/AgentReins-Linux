@@ -1,0 +1,7 @@
+{
+  "url": "http://127.0.0.1:18920/runtime",
+  "token": "REPLACE_WITH_SOURCE_TOKEN",
+  "agentsFile": "/etc/agentreins/agents.yaml",
+  "containerPatterns": ["target-01-.*", "target-02-.*", "pentagi-terminal-.*", ".*-pentagi-terminal-.*"],
+  "policies": {}
+}

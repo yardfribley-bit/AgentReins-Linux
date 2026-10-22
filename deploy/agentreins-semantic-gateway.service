@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=-/etc/agentreins/gateway.env
+Environment=PYTHONPATH=/opt/agentreins-runtime
+Environment=AGENTREINS_RUNTIME=/opt/agentreins-runtime
 ExecStart=/usr/bin/python3 /opt/agentreins/semantic_gateway.py
 Restart=on-failure
 RestartSec=3

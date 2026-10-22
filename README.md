@@ -32,7 +32,9 @@ AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络
 
 ## Runtime 告警与审批首版
 
-新增 [Runtime 告警台](https://www.agentreins.info/runtime)，支持 S01/S04/S05 主机证据告警、独立覆盖心跳和持久人工审阅。REA analyze 接入单次执行前审批；公开只读，处置凭证独立。S02/S03 需要进一步贯通任务身份，主机阻断和自动 FOFA 联动未启用。范围、部署与验证见 [Runtime 说明](docs/RUNTIME.md)。
+新增 [Runtime 告警台](https://www.agentreins.info/runtime)，支持 S01/S04/S05 主机证据告警、独立覆盖心跳和持久人工审阅。REA analyze 接入单次执行前审批；公开只读，处置凭证独立。主机阻断和自动 FOFA 联动未启用。
+
+2026-10-21 起，S02/S03 可以通过语义网关的路由绑定和容器到 agent 的映射，在 Dify 与 PentAGI 这类生产形态上告警：不受信输入到达模型之后，高风险工具调用先出语义段，主机事件按参数实体精确匹配后升级同一条告警。S08 对敏感或持久化路径的写入只告警，保留前后 SHA-256，不回滚。只读导出脚本给出带哈希链的 JSONL、CSV 和 Markdown。入站 HTTP 按 agents.yaml 的 inbound 映射成 60 秒汇总，并据此告警扫描、认证失败、错误率和请求特征；工具参数里的凭据和外发到元数据或内网地址另有告警。配置、边界和部署步骤见 [Runtime 说明](docs/RUNTIME.md)。
 
 ## 在线体验
 
@@ -131,7 +133,8 @@ console/     通用控制台、PentAGI 驾驶舱、历史索引与候选关联
 policy/      自然语言编译、Policy IR、AgentSpec 兼容与策略验证
 deploy/      主机服务和持续运行配置
 docs/        架构、调查方法与历史证据存档
-config/      策略和产品配置
+config/      策略、agent 路由和产品配置样例
+scripts/     只读时间窗导出、容器 upperdir 差异、S02/S03 与新规则的本地重放
 tests/       自动化验证
 ```
 

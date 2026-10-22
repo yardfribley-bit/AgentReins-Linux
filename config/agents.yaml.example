@@ -1,0 +1,56 @@
+# Copy to /etc/agentreins/agents.yaml and replace the documentation ranges
+# (RFC 5737) with this host's docker bridge CIDRs. Do not commit real addresses.
+# Patterns are regular expressions when they contain ".*", otherwise globs.
+# containerPatterns in sensor.json should list the same container names.
+agents:
+  - id: target-01
+    gateway:
+      bind: "127.0.0.1"
+      port: 18901
+      peerAllowlist: ["192.0.2.0/24"]
+    containers:
+      - pattern: "target-01-.*"
+      # A narrower pattern can carry a role. database and cache do not raise S20.
+      # - pattern: "target-01-api"
+      #   role: api
+    allowedNetworks:
+      - cidr: "192.0.2.0/24"
+        ports: [80, 443]
+    inbound:
+      vhost: ["target-01.invalid"]
+      port: [8080]
+      pathPrefix: ["/"]
+      loginPaths: ["/auth/login"]
+    internalNetworks:
+      - "192.0.2.0/24"
+    hostGateways: ["192.0.2.1"]
+    # webServers: ["nginx"]
+    # allowedTools: ["status"]
+    # knowledgeMarkers stay unset until the real prompt template is confirmed.
+    # knowledgeMarkers: {start: "[[KB]]", end: "[[/KB]]"}
+  - id: target-02
+    gateway:
+      bind: "127.0.0.1"
+      port: 18903
+      peerAllowlist: ["192.0.2.0/24"]
+    containers:
+      - pattern: "target-02-.*"
+    allowedNetworks:
+      - cidr: "192.0.2.0/24"
+    inbound:
+      vhost: ["target-02.invalid"]
+      port: [8081]
+      pathPrefix: ["/"]
+      loginPaths: ["/auth/login"]
+    internalNetworks:
+      - "198.51.100.0/24"
+    hostGateways: ["192.0.2.1"]
+  - id: attacker-01
+    gateway: {port: 18902, peerAllowlist: ["198.51.100.0/24"]}
+    containers:
+      - pattern: "pentagi-terminal-*"
+      - pattern: "*-pentagi-terminal-*"
+    allowedNetworks:
+      - cidr: "203.0.113.0/24"
+    internalNetworks:
+      - "203.0.113.0/24"

@@ -25,11 +25,13 @@ from __future__ import annotations
 from activity_policy import policy as persistence_policy
 import argparse
 import ctypes
+import datetime
 import hashlib
 import json
 import os
 import queue
 import re
+import shlex
 import socket
 import struct
 import subprocess
@@ -50,10 +52,22 @@ seen: "deque[str]" = deque(maxlen=20000)
 def mask_passwords(text: str) -> str:
     """Keep commands verbatim, redact only values that can authenticate."""
     text = re.sub(r"(?im)^([ \t]*#\s*root\s*\n[ \t]*#\s*)\S+", r"\1******", text)
-    text = re.sub(r"(?i)\b(password|passwd|pwd)(\s*[:=]\s*)(?![$(])([^\s\"']+)", r"\1\2******", text)
-    text = re.sub(r"(?i)(Authorization:\s*(?:Bearer|Basic)\s+)\S+", r"\1******", text)
-    text = re.sub(r"(?i)(https?://[^\s/:]+:)[^@/\s]+@", r"\1******@", text)
-    return text
+    try:
+        from runtime.redact import redact_text
+    except ImportError:
+        runtime = os.environ.get("AGENTREINS_RUNTIME", "/opt/agentreins-runtime")
+        if runtime not in sys.path:
+            sys.path.insert(0, runtime)
+        try:
+            from redact import redact_text
+        except ImportError:
+            text = re.sub(r"(?i)((?:password|passwd|pwd|api[_-]?key|token|secret)\s*[=:]\s*)[^\s\"']+", r"\1[REDACTED]", text)
+            text = re.sub(r"(?i)(--(?:api[_-]?key|token|password|secret|with-token)(?:\s+|=))[^\s\"']+", r"\1[REDACTED]", text)
+            text = re.sub(r"(?i)(Authorization:\s*(?:Bearer|Basic)\s+)[^\s\"']+", r"\1[REDACTED]", text)
+            text = re.sub(r"(?i)(-u\s+[^\s:]+:)[^\s\"']+", r"\1[REDACTED]", text)
+            text = re.sub(r"(?i)([A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)[^\s\"']+", r"\1[REDACTED]", text)
+            return re.sub(r"(https?://[^\s/:\"']+:)[^@/\s\"']+@", r"\1[REDACTED]@", text)
+    return redact_text(text)
 
 
 def event_key(event: dict) -> str:
@@ -72,13 +86,19 @@ def emit(event: dict) -> None:
 
 
 def now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    """Observation time with milliseconds. Whole-second stamps sort before a tool call in the same second and drop the host link."""
+    return datetime.datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
 def read_cmdline(pid: int) -> str:
+    """Rebuild argv with quotes so shell redirects survive later parsing."""
     try:
         with open("/proc/%d/cmdline" % pid, "rb") as fh:
-            return fh.read(4096).replace(b"\0", b" ").decode("utf-8", "replace").strip()
+            raw = fh.read(4096)
+        parts = [part.decode("utf-8", "replace") for part in raw.split(b"\0")]
+        while parts and parts[-1] == "":
+            parts.pop()
+        return shlex.join(parts) if parts else ""
     except OSError:
         return ""
 
@@ -347,6 +367,127 @@ IN_ACCESS, IN_MODIFY, IN_OPEN, IN_CREATE, IN_DELETE = 0x1, 0x2, 0x20, 0x100, 0x2
 WATCH_MASK = IN_ACCESS | IN_MODIFY | IN_OPEN | IN_CREATE | IN_DELETE
 OP_NAMES = {IN_ACCESS: "FILE_ACCESS", IN_MODIFY: "FILE_MODIFY", IN_OPEN: "FILE_OPEN",
             IN_CREATE: "FILE_CREATE", IN_DELETE: "FILE_DELETE"}
+# fanotify is observe-only. It is used when this host cannot register as the
+# audit daemon (an outer auditd already owns the kernel audit socket).
+FAN_MODIFY, FAN_CLOSE_WRITE, FAN_OPEN, FAN_ACCESS = 0x2, 0x8, 0x20, 0x1
+FAN_CLASS_NOTIF, FAN_CLOEXEC, FAN_MARK_ADD = 0x0, 0x1, 0x1
+
+
+def fanotify_records(path, pid, mask, ppid=0, cmdline="", container_id=""):
+    """Build sensor-ready records for one fanotify metadata event. No file body is read."""
+    if not path or not pid:
+        return []
+    write = bool(mask & (FAN_MODIFY | FAN_CLOSE_WRITE))
+    opened = bool(mask & (FAN_OPEN | FAN_ACCESS))
+    if not write and not opened:
+        return []
+    access = "metadata_or_write" if write else "read_open"
+    base = {
+        "time": now_iso(), "component": "HostFanotify", "category": "kernel",
+        "process": (cmdline.split(" ", 1)[0] if cmdline else ""),
+        "pid": int(pid), "ppid": int(ppid or 0),
+        "containerId": container_id or "", "container": container_id or "",
+        "result": "SUCCESS", "source": "fanotify observe-only",
+    }
+    file_event = dict(base)
+    file_event.update({
+        "operation": "AUDIT_FILE",
+        "resource": path,
+        "data": "mask=0x%x" % mask,
+        "evidence": {"paths": [path], "access": access, "auditKey": "agentreins_persist" if write else "agentreins_sensitive", "pid": int(pid)},
+    })
+    records = [file_event]
+    if cmdline:
+        exec_event = dict(base)
+        exec_event.update({
+            "operation": "EXEC",
+            "resource": cmdline,
+            "data": "fanotify pid cmdline",
+            "evidence": {"cmdline": cmdline, "pid": int(pid), "cwd": read_cwd(pid)},
+        })
+        records.append(exec_event)
+    return records
+
+
+class FanotifyDedup:
+    """One read emits FAN_OPEN then FAN_ACCESS (a write emits MODIFY then CLOSE_WRITE).
+    The later event often arrives after a short-lived process exited, so its container
+    lookup comes back empty. Keep one record per (pid, path, access) within a short
+    window, and reuse the container ID seen first for that pid."""
+
+    def __init__(self, window=2.0, limit=4096):
+        self.window = window
+        self.limit = limit
+        self.seen = {}
+        self.containers = {}
+
+    def admit(self, pid, path, mask, container_id, now=None):
+        now = time.monotonic() if now is None else now
+        if len(self.seen) > self.limit:
+            cutoff = now - self.window
+            self.seen = {k: v for k, v in self.seen.items() if v >= cutoff}
+            self.containers = {k: v for k, v in self.containers.items() if v[1] >= cutoff}
+        if container_id:
+            self.containers[pid] = (container_id, now)
+        elif pid in self.containers and now - self.containers[pid][1] <= self.window:
+            container_id = self.containers[pid][0]
+        write = bool(mask & (FAN_MODIFY | FAN_CLOSE_WRITE))
+        key = (pid, path, write)
+        last = self.seen.get(key)
+        self.seen[key] = now
+        if last is not None and now - last <= self.window:
+            return False, container_id
+        return True, container_id
+
+
+def fanotify_stream(cfg: argparse.Namespace) -> None:
+    paths = [p for p in (getattr(cfg, "fanotify", None) or []) if p and os.path.exists(p)]
+    if not paths:
+        return
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
+    libc.fanotify_init.restype = ctypes.c_int
+    libc.fanotify_mark.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_ulonglong, ctypes.c_int, ctypes.c_char_p]
+    libc.fanotify_mark.restype = ctypes.c_int
+    fd = libc.fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC, os.O_RDONLY)
+    if fd < 0:
+        print("fanotify_init failed: %s" % os.strerror(ctypes.get_errno()), flush=True)
+        return
+    mask = FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE_WRITE
+    for path in paths:
+        if libc.fanotify_mark(fd, FAN_MARK_ADD, mask, -100, path.encode()) != 0:
+            print("fanotify_mark %s failed: %s" % (path, os.strerror(ctypes.get_errno())), flush=True)
+    print("fanotify watching %s" % ",".join(paths), flush=True)
+    dedup = FanotifyDedup()
+    while True:
+        try:
+            buf = os.read(fd, 8192)
+        except OSError:
+            time.sleep(1)
+            continue
+        pos = 0
+        while pos + 24 <= len(buf):
+            event_len, _vers, _reserved, _metadata_len, event_mask, event_fd, epid = struct.unpack_from("=IBBHQii", buf, pos)
+            if event_len < 24:
+                break
+            pos += event_len
+            path = ""
+            if event_fd >= 0:
+                try:
+                    path = os.readlink("/proc/self/fd/%d" % event_fd)
+                except OSError:
+                    path = ""
+                os.close(event_fd)
+            if epid <= 0 or epid == os.getpid() or not path:
+                continue
+            cmdline = read_cmdline(epid)
+            if any(skip in cmdline for skip in ("sensor.py", "audit_bridge.py", "agentreins_host_stream.py")):
+                continue
+            admit, cid = dedup.admit(epid, path, event_mask, container_of(epid))
+            if not admit:
+                continue
+            for record in fanotify_records(path, epid, event_mask, read_ppid(epid), cmdline, cid):
+                emit(record)
 
 
 def inotify_stream(cfg: argparse.Namespace) -> None:
@@ -541,9 +682,12 @@ def parse_args() -> argparse.Namespace:
                                                    "/var/log/agentreins/host.jsonl"))
     p.add_argument("--ingest-url", default=os.environ.get("AGENTREINS_INGEST_URL", ""))
     p.add_argument("--ingest-token-file", default=os.environ.get("AGENTREINS_INGEST_TOKEN_FILE", ""))
+    p.add_argument("--fanotify", default=os.environ.get("AGENTREINS_FANOTIFY", ""),
+                   help="comma-separated existing files to observe when auditd cannot be registered")
     cfg = p.parse_args()
     cfg.keywords = [k.strip() for k in cfg.keywords.split(",") if k.strip()]
     cfg.targets = [t.strip() for t in cfg.targets.split(",") if t.strip()]
+    cfg.fanotify = [p.strip() for p in cfg.fanotify.split(",") if p.strip()]
     return cfg
 
 
@@ -552,7 +696,7 @@ def main() -> None:
         sys.exit("host observation requires root (netlink proc connector, inotify)")
     cfg = parse_args()
     threading.Thread(target=refresh_pid_map, daemon=True).start()
-    for target in (container_stream, proc_stream, inotify_stream, egress_stream, sink_loop):
+    for target in (container_stream, proc_stream, inotify_stream, egress_stream, fanotify_stream, sink_loop):
         threading.Thread(target=target, args=(cfg,), daemon=True).start()
     print("AgentReins host observer active: agent=%s watch=%s targets=%s"
           % (cfg.agent, cfg.watch, cfg.targets or "-"), flush=True)
