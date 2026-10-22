@@ -327,6 +327,20 @@ def bound_event(event):
     if shrink() > PAYLOAD_LIMIT:
         event['untrustedSegments'] = [{'digest': s.get('digest'), 'confidence': s.get('confidence'), 'sourceKind': s.get('sourceKind'), 'role': s.get('role')} for s in segments]
         event['textExcerpt'] = ''
+        compact_tools = []
+        for item in (event.get('toolDefinitions') or [])[:64]:
+            if not isinstance(item, dict):
+                continue
+            kept = {
+                'name': str(item.get('name') or '')[:120],
+                'hash': item.get('hash'),
+                'paramNames': [str(name)[:80] for name in (item.get('paramNames') or [])[:32]],
+                'suspicious': [str(flag)[:40] for flag in (item.get('suspicious') or [])[:8]],
+            }
+            if isinstance(item.get('description'), str) and item.get('description'):
+                kept['description'] = item['description'][:80]
+            compact_tools.append(kept)
+        event['toolDefinitions'] = compact_tools
     return event
 
 

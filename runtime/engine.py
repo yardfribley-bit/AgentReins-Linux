@@ -23,9 +23,10 @@ RULES=[
  {'id':'S19','version':'1.0','name':'认证失败突发','severity':'high','sources':['http'],'condition':'同一来源对已登记登录路径，在 60 秒汇总内 401/403 次数达到阈值','falsePositive':'用户输错一次、令牌过期后的少量重试','mode':'alert','limitation':'需要在 agents.yaml 登记登录路径前缀；默认阈值高于单次失败'},
  {'id':'S20','version':'1.0','name':'应用容器连接元数据或内网','severity':'high','sources':['network'],'condition':'web/api/worker/plugin/sandbox 角色的容器连接元数据段、回环、宿主机网关或其他 Agent 网段','falsePositive':'健康探测打到已允许的地址','mode':'alert','limitation':'数据库和缓存角色不触发；ssrf_proxy 日志未接入，代理后的真实目的看不到'},
  {'id':'S21','version':'1.0','name':'入站请求特征类别','severity':'medium','sources':['http'],'condition':'60 秒汇总内同一来源的 URI 或 UA 类别计数达到阈值','falsePositive':'搜索框里的普通文本、安全团队自己的探测','mode':'alert','limitation':'只保留类别和计数，不保留原始 URI；编码可以绕过'},
- {'id':'S22','version':'1.0','name':'Web 服务派生 shell 或下载工具','severity':'high','sources':['process'],'condition':'Web/API 容器内，已登记的 Web 服务进程派生 shell 或下载工具','falsePositive':'镜像启动脚本','mode':'alert','limitation':'sandbox 角色不触发；父进程不可见时可信度为 inferred，不记为已观察'}]
+ {'id':'S22','version':'1.0','name':'Web 服务派生 shell 或下载工具','severity':'high','sources':['process'],'condition':'Web/API 容器内，已登记的 Web 服务进程派生 shell 或下载工具','falsePositive':'镜像启动脚本','mode':'alert','limitation':'sandbox 角色不触发；父进程不可见时可信度为 inferred，不记为已观察'},
+ {'id':'S23','version':'1.0','name':'工具定义发生变化','severity':'medium','sources':['model'],'condition':'基线建立后出现新工具名，或已有工具的规范哈希变化；描述中的隐藏文本或指令式文字单独告警；工具消失只记为 info','falsePositive':'学习窗口内的首次上线、JSON 键顺序变化、与固定哈希相同的定义','mode':'alert','limitation':'只告警，不阻断。学习期默认是前 10 次声明和 10 分钟里较晚的那个，建立基线的那一次请求本身不告警。固定哈希优先于学到的基线。描述只保留截断并遮盖后的文本。工具消失是 info。'}]
 def rule_layer(rule):
- if rule in ('S02','S03','S13','S14','S15','S16','P01'):return 'D'
+ if rule in ('S02','S03','S13','S14','S15','S16','S23','P01'):return 'D'
  return 'B'
 def _related_alerts(c,aid,chain_id,agent_id,window,rules=None):
  if chain_id:
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS intel(id TEXT PRIMARY KEY,time REAL,payload TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
 CREATE TABLE IF NOT EXISTS coverage_losses(source TEXT,time REAL,audit INTEGER,sensor INTEGER);
 CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
+CREATE TABLE IF NOT EXISTS tool_baselines(agent_id TEXT PRIMARY KEY, payload TEXT);
 ''')
    c.execute('PRAGMA max_page_count=65536')
  @contextlib.contextmanager
@@ -124,12 +126,13 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    x=json.loads(r[0]);scope=x['scope']
    if x.get('rule')==rule and all(str(e.get(k,''))==str(v) for k,v in scope.items()):return True
   return False
- def _alert(self,c,rule,e,refs,title,relation='explicit',basis='工作负载身份与直接主机事件',gate_id=None,confidence=None):
+ def _alert(self,c,rule,e,refs,title,relation='explicit',basis='工作负载身份与直接主机事件',gate_id=None,confidence=None,severity=None):
   spec=next(r for r in RULES if r['id']==rule)
   if self._suppressed(c,e,rule):return None
-  now=self.clock()
+  now=self.clock();sev=severity if severity in ('info','low','medium','high','critical') else spec['severity']
   if not gate_id:
-   aggregate=digest([rule,e['source'],e['workload'],e.get('destination'),e.get('port'),e.get('path'),e.get('command') if rule in ('S03','S04') else None])
+   if rule=='S23':aggregate=digest(['S23',e.get('source'),e.get('agentId'),e.get('path'),e.get('command')])
+   else:aggregate=digest([rule,e['source'],e['workload'],e.get('destination'),e.get('port'),e.get('path'),e.get('command') if rule in ('S03','S04') else None])
    prior=c.execute('SELECT id,payload FROM alerts WHERE rule=? AND time>? ORDER BY time DESC LIMIT 200',(rule,now-300)).fetchall()
    for old in prior:
     existing=json.loads(old['payload'])
@@ -148,13 +151,16 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
   key=digest([rule,e['source'],e['id'],gate_id]);aid='al_'+key[:24];coverage=self.coverage(c,e['source'])
   rel={'strength':relation,'basis':basis}
   if confidence or relation=='explicit':rel['confidence']=confidence or 'observed'
-  value={'id':aid,'aggregateKey':aggregate,'count':1,'firstSeen':e['time'],'lastSeen':e['time'],'sampleEventIds':[e['id']],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'pending' if gate_id else 'open','revision':1,'source':e['source'],'workload':e['workload'],'runId':e.get('runId'),'agentId':e.get('agentId'),'sessionId':e.get('sessionId'),'gateId':gate_id,'relation':rel,'evidence':refs,'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
+  value={'id':aid,'aggregateKey':aggregate,'count':1,'firstSeen':e['time'],'lastSeen':e['time'],'sampleEventIds':[e['id']],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':sev,'title':title,'status':'pending' if gate_id else 'open','revision':1,'source':e['source'],'workload':e['workload'],'runId':e.get('runId'),'agentId':e.get('agentId'),'sessionId':e.get('sessionId'),'gateId':gate_id,'relation':rel,'evidence':refs,'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
   if e.get('chainId'):value['chainId']=e.get('chainId')
   if e.get('toolCallId'):value['toolCallId']=e.get('toolCallId')
   value['layer']=rule_layer(rule)
   if e.get('secretFindings'):value['secretFindings']=[{'category':x.get('category'),'digest':x.get('digest')} for x in e['secretFindings'][:16] if isinstance(x,dict) and x.get('category') and x.get('digest')]
   if e.get('sha256Before') or e.get('sha256After'):value['fileDigest']={'before':e.get('sha256Before'),'after':e.get('sha256After'),'size':e.get('size')}
-  c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],value['status'],key,compact(value)));return aid
+  if isinstance(e.get('toolDefinition'),dict):
+   td=e['toolDefinition']
+   value['toolDefinition']={'toolName':str(td.get('toolName') or '')[:120],'change':str(td.get('change') or '')[:32],'oldHash':td.get('oldHash'),'newHash':td.get('newHash'),'diff':redact_text(str(td.get('diff') or ''))[:2048],'suspicious':[str(x)[:40] for x in (td.get('suspicious') or [])[:8]]}
+  c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,sev,value['status'],key,compact(value)));return aid
  def ingest(self,source,items):
   if not isinstance(items,list):raise ValueError('events 必须为数组')
   if len(items)>100:raise ValueError('最多 100 条事件')
@@ -165,6 +171,10 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    for index,item in enumerate(items):
     try:
      if not isinstance(item,dict):raise ValueError('事件必须为对象')
+     if item.get('operation')=='TOOL_DEFINITIONS':
+      try:from runtime.tool_definitions import annotate
+      except ImportError:from tool_definitions import annotate
+      item=annotate(item)
      if (item.get('kind')=='tool' or item.get('operation')=='TOOL_CALL') and not item.get('secretFindings'):
       raw_args=item.get('arguments')
       if raw_args is None and isinstance(item.get('function'),dict):raw_args=item['function'].get('arguments')
@@ -229,6 +239,9 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
   try:from runtime.http_rules import detect_extra
   except ImportError:from http_rules import detect_extra
   detect_extra(self,c,e)
+  try:from runtime.tool_definitions import observe_definitions
+  except ImportError:from tool_definitions import observe_definitions
+  observe_definitions(self,c,e)
   try:from runtime.chain_detect import observe
   except ImportError:from chain_detect import observe
   observe(self,c,e)

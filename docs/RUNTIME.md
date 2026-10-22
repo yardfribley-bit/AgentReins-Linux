@@ -10,6 +10,7 @@
 - S02/S03：语义网关按路由绑定 agent，传感器把容器名映射到同一 agent。不受信输入（工具结果、检索、文档、上传、网页等来源类别，不解析提示词）之后的高风险工具调用先产生 S03 语义段；同一 agent 上参数实体与主机事件精确一致时，升级同一条告警。S02 只在该连接还落在已配置 allowedNetworks 之外时另开一条。名称仍是“可疑模型到命令执行链”和“工具后的非白名单外联”，不断言提示注入。只有时间邻近、缺少 agent、或 agent 不一致，都不关联。Dify API bridge 只作旁路，不触发这两条规则。同一 Dify 实例里的多个应用仍无法按容器拆开。
 - S08：已登记工作负载对敏感或持久化路径的写入。只告警，不阻断、不回滚。证据保留写入前后 SHA-256 和大小（能读到文件时），不保留正文。
 - P01：独立的执行前审批策略，覆盖 REA analyze 和固定命令实验入口。不冒充 S04 危险行为已发生。没有审批或服务不可用则不执行。
+- S23：语义网关对每次带 `tools` 或旧式 `functions` 的模型请求，按工具名、描述和参数模式计算规范 SHA-256。每个 agent 的基线写在 runtime SQLite。学习期默认是前 10 次声明和 10 分钟里较晚的那个；基线建立之后，新工具名或哈希变化告警，描述里的隐藏字符、指令式短句或超长 base64 另记一条中等级别告警，工具消失只记 info。`toolDefinitionBaseline.pinned` 里的哈希优先于学到的值。只告警，不阻断，不改写模型请求。
 - 未接入工具不受审批保护；不提供主机层杀进程/断网。WebLens 仅支持人工导入可追溯候选，不自动查 FOFA、不自动启用策略。内核阻断保持关闭。
 
 ## 身份与数据
@@ -121,7 +122,7 @@ host-stream 与 audit 的 argv 现用 `shlex.join` 保留引号，因此 `bash -
 
 ### 验证
 
-`PYTHONPATH=. python3 -m unittest tests.runtime.test_s02s03 tests.runtime.test_runtime tests.runtime.test_review_fixes tests.runtime.test_next_iteration tests.runtime.test_public_api tests.runtime.test_capability tests.policy.test_compiler tests.test_console_observation tests.test_history_retention`
+`PYTHONPATH=. python3 -m unittest tests.runtime.test_s02s03 tests.runtime.test_runtime tests.runtime.test_review_fixes tests.runtime.test_next_iteration tests.runtime.test_public_api tests.runtime.test_capability tests.runtime.test_tool_definitions tests.policy.test_compiler tests.test_console_observation tests.test_history_retention`
 
 覆盖 V1–V6、F1–F4、S08 哈希、导出哈希链、upperdir 的 whiteout 删除、入站汇总与 S13–S22，以及既有运行时用例。控制台列表会显示 phase、confidence、agentId、chainId、layer；处置身份可以按 chainId、agentId、layer 筛选和分组。匿名公开投影的字段范围保持不变，也不能用这些字段过滤。
 
@@ -166,4 +167,66 @@ PYTHONPATH=. python3 scripts/false_alarm_baseline.py /tmp/cap-baseline
 2. 把 `collector/http_access.py` 和更新后的 `semantic_gateway.py` 放到 `/opt/agentreins/`。`deploy/agentreins-http-access.service` 是汇总进程的样例，确认日志路径后再启用。
 3. 编辑 `/etc/agentreins/agents.yaml` 的 inbound，把样例里的 `.invalid` 和 RFC 5737 网段换成这台机器的 vhost 和网桥。不要把真实地址提交回仓库。
 4. 需要 S14、S15、S22 或知识库标记时再写入对应字段。S20 要给应用容器单独的 pattern 和 role，不要把数据库容器标成 api。
-5. 传感器版本字符串是 `runtime-1.4-http`。重启 runtime、sensor 和语义网关后，新规则才会出现在 `/runtime/api/rules`。
+5. 传感器版本字符串在这一节当时是 `runtime-1.4-http`。重启 runtime、sensor 和语义网关后，新规则才会出现在 `/runtime/api/rules`。
+
+## 演练准备：工具定义与部署清单（2026-10-22）
+
+S01–S08 的含义不变。S23 是只告警的工具定义规则，补的是工具被调换或描述被塞进隐藏文字这一类供应链信号。它不证明提示注入，也不拦截这次请求。
+
+### S23
+
+网关在转发之前读取本次请求的 `tools`，以及旧协议的 `functions`。每个工具取名字、描述和参数模式，用键排序后的规范 JSON 做 SHA-256。只比较请求里确实带了这两个字段之一的情况；字段不出现不算全部工具消失，空数组才表示当前没有工具。同一请求里同名工具以最后一次为准。
+
+基线按 agentId 存在 runtime 的 `tool_baselines` 表。默认学习期是 10 次声明并且过了 10 分钟，取较晚的那个：次数先到而时间未到，或者时间先到而次数未到，都还在学习。建立基线的那一次请求本身不告警，它带上的定义记入基线。学习期内不告新工具、不告哈希变化、不告消失。描述里的隐藏文本不受学习期限制。`agents.yaml` 可以写：
+
+```yaml
+toolDefinitionBaseline:
+  learnRequests: 10
+  learnSeconds: 600
+  pinned:
+    status: "<64 hex chars from a capture>"
+```
+
+`pinned` 优先。对得上固定哈希就不告；对不上就告，而且不会用这次看到的哈希覆盖固定值。没写这个键时用上面的默认值，S23 仍然开启。
+
+告警都带 agentId、chainId，可信度是 observed。新工具和哈希变化是 medium，控制台列出旧哈希和新哈希，以及描述或参数名的短差异。差异经过 `runtime/redact.py`，单条描述入库不超过 400 字符，不保留超过 2 KB 的原文，超长 base64 记成 `[BASE64]`。工具从声明里消失是 info，下一次以相同哈希回来不再当新工具。JSON 键的顺序不同不算变化。
+
+描述另有一条 medium 告警，类别是 `instruction_like`（`ignore previous`、`do not tell the user`）、`hidden_unicode`（零宽字符或 Unicode tag）或 `base64_blob`（连续 base64 超过 200 字符）。正常工具说明里如果写了这些短句，也会命中，这是这条规则的误报面。
+
+| 规则 | 缺什么就不启用 | 模板里的默认 |
+|---|---|---|
+| S02 | `allowedNetworks` 为空时，范围外目的不会进入这条规则；仍需要不受信片段和精确主机匹配 | 注释掉，等填写网桥和模型出口 |
+| S05 | `allowedNetworks` 为空 | 同上 |
+| S14 | `allowedTools` 为空或不写 | 注释掉，用捕获结果填写 |
+| S15 | runtime `config.json` 没有 `toolThresholds` | 注释里的保守下限是每分钟 30、同一链路同一工具 12 |
+| S22 | `webServers` 为空，或容器没有 web/api 角色 | Dify 注释为 nginx、gunicorn、node |
+| I1 | `knowledgeMarkers` 不写，或起止标记相同 | Dify 的 `<context>` 标记为 TO-VERIFY |
+| S20 | 容器没有 web/api/worker/plugin/sandbox 角色 | 角色行是注释 |
+| S23 | 无。不写配置也按 10 次和 10 分钟学习 | 固定哈希留空，等捕获 |
+
+### Drill deployment checklist
+
+1. 把 `runtime/`（含 `tool_definitions.py`）放到 `/opt/agentreins-runtime`，把 `collector/semantic_gateway.py` 放到 `/opt/agentreins/`。重启 runtime、sensor 和语义网关。传感器版本字符串是 `runtime-1.5-s23`。不要打开内核阻断，不要改写模型响应。
+2. 复制 `deploy/agents.example.drill.yaml` 为 `/etc/agentreins/agents.yaml`。先不要取消那些注释。把 sensor.json 的 `containerPatterns` 写成同一批容器名。`peerAllowlist` 在取消注释之前是空的，空名单会放行所有来源。
+3. 用文档网段把网关接到 dify-a、dify-b 和 pentagi，跑一段正常流量。不要把真实地址写回仓库。
+4. 只读生成建议，不要让脚本写数据库：
+
+```bash
+PYTHONPATH=. python3 scripts/derive_config.py \
+  --db /var/lib/agentreins-runtime/runtime.sqlite \
+  --gateway-log /var/log/agentreins/semantic.jsonl \
+  --since <start> --until <end>
+```
+
+建议里的 `allowedTools` 是窗口内出现过的工具名。`toolThresholds` 是每分钟次数和同一链路同一工具次数的 p99 再乘 3。捕获短于一个忙时，就保留模板里的下限（30 和 12），取两者里更大的数。`allowedNetworks` 是看到的 IP 的 /32。`knowledgeMarkers` 是系统提示里重复出现的成对标记，标了 TO-VERIFY，对上真实提示再写入。
+5. 把决定启用的字段取消注释，`toolThresholds` 写进 runtime 的 config.json，不是 agents.yaml。固定哈希从网关的 `TOOL_DEFINITIONS` 行抄。
+6. 再跑一次检查，确认要开的规则不再是 disabled：
+
+```bash
+PYTHONPATH=. python3 scripts/check_config.py \
+  --agents /etc/agentreins/agents.yaml \
+  --runtime-config /etc/agentreins-runtime/config.json
+```
+
+7. 重启网关和 runtime。S14、S15、S22、S02 和知识库标记这才会按填写的配置工作。S23 在重启后按学习期开始记基线。
+

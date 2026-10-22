@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Negative cases for the new rules. Exits 0 only when none of them alert."""
+"""Negative cases for the new rules, including S23 learning and key reordering. Exits 0 only when none of them alert."""
 import json
 import sys
 from pathlib import Path

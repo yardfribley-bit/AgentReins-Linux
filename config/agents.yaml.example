@@ -28,6 +28,11 @@ agents:
     # allowedTools: ["status"]
     # knowledgeMarkers stay unset until the real prompt template is confirmed.
     # knowledgeMarkers: {start: "[[KB]]", end: "[[/KB]]"}
+    # toolDefinitionBaseline stays at the built-in default (10 requests and 10
+    # minutes, whichever is later) until a capture supplies pinned hashes.
+    # toolDefinitionBaseline: {learnRequests: 10, learnSeconds: 600, pinned: {}}
+    # A fill-in drill template for dify-a, dify-b, and pentagi is
+    # deploy/agents.example.drill.yaml.
   - id: target-02
     gateway:
       bind: "127.0.0.1"

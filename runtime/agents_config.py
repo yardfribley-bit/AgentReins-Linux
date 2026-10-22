@@ -56,6 +56,32 @@ def _as_list(value):
     return [value]
 
 
+def _baseline(raw):
+    body = raw.get('toolDefinitionBaseline') if isinstance(raw, dict) else None
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        requests = int(body.get('learnRequests') if body.get('learnRequests') not in (None, '') else 10)
+    except (TypeError, ValueError):
+        requests = 10
+    try:
+        seconds = int(body.get('learnSeconds') if body.get('learnSeconds') not in (None, '') else 600)
+    except (TypeError, ValueError):
+        seconds = 600
+    pinned = {}
+    source = body.get('pinned') if isinstance(body.get('pinned'), dict) else {}
+    for key, value in source.items():
+        name = str(key).strip()
+        digest = str(value or '').strip().lower()
+        if name and re.fullmatch(r'[0-9a-f]{64}', digest):
+            pinned[name] = digest
+    return {
+        'learnRequests': min(100000, max(1, requests)),
+        'learnSeconds': min(7 * 86400, max(0, seconds)),
+        'pinned': pinned,
+    }
+
+
 def _markers(raw):
     markers = raw.get('knowledgeMarkers') if isinstance(raw, dict) else None
     if not isinstance(markers, dict):
@@ -108,6 +134,7 @@ def normalize_agent(raw):
         'hostGateways': [str(item) for item in _as_list(raw.get('hostGateways'))],
         'webServers': [str(item) for item in _as_list(raw.get('webServers'))],
         'knowledgeMarkers': _markers(raw),
+        'toolDefinitionBaseline': _baseline(raw),
         'inbound': {
             'vhost': [str(item).lower() for item in _as_list(inbound.get('vhost'))],
             'port': ports,
