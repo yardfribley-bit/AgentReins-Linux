@@ -214,12 +214,43 @@ def docker_inspect(name):
     for mount in info.get('Mounts') or []:
         mounts.append({'type': mount.get('Type'), 'destination': mount.get('Destination'), 'covered': False, 'reason': BLIND})
     lower = data.get('LowerDir') or ''
+    driver = graph.get('Name')
+    upper = data.get('UpperDir')
+    if not upper:
+        # Docker 29 with the containerd image store reports no GraphDriver. The
+        # container root is still an overlay mount; read upperdir from its mountinfo.
+        pid = (info.get('State') or {}).get('Pid') or 0
+        found = overlay_from_mountinfo('/proc/%d/mountinfo' % pid) if pid else None
+        if found:
+            driver = driver or 'overlayfs'
+            upper, lower = found['upper'], found['lower']
     return {
-        'driver': graph.get('Name'),
-        'upper': data.get('UpperDir'),
+        'driver': driver,
+        'upper': upper,
         'lowers': [part for part in lower.split(':') if part],
         'mounts': mounts,
     }
+
+
+def overlay_from_mountinfo(path):
+    """Return upperdir/lowerdir of the overlay mounted at / in a mountinfo file, or None."""
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        head, sep, tail = line.partition(' - ')
+        fields = head.split()
+        parts = tail.split()
+        if not sep or len(fields) < 5 or len(parts) < 3 or fields[4] != '/' or parts[0] != 'overlay':
+            continue
+        options = {}
+        for item in parts[2].split(','):
+            key, _, value = item.partition('=')
+            options[key] = value
+        if options.get('upperdir'):
+            return {'upper': options['upperdir'], 'lower': options.get('lowerdir', '')}
+    return None
 
 
 def write_jsonl(path, records):
@@ -253,7 +284,7 @@ def main():
         driver = info['driver']
         upper = info['upper']
         mounts = info['mounts']
-        if driver != 'overlay2' or not upper:
+        if driver not in ('overlay2', 'overlayfs') or not upper:
             note = 'driver %s has no overlay upperdir; path list only via docker diff' % driver
             records = [coverage_record(args.name, args.phase, driver, mounts, upper, note)]
             try:

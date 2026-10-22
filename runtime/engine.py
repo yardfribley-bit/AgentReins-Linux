@@ -258,7 +258,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
   found=self._find_chain_alert(c,rule,e['source'],chain_id,tool_call_id)
   if found:return found
   key=digest(['chain',rule,e['source'],chain_id,tool_call_id or e.get('id')]);aid='al_'+key[:24];coverage=self.coverage(c,e['source'])
-  value={'id':aid,'aggregateKey':key,'count':1,'firstSeen':min(x.get('time',e['time']) for x in refs),'lastSeen':e['time'],'sampleEventIds':[x.get('id') for x in refs if x.get('id')],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'open','revision':1,'source':e['source'],'workload':e.get('workload'),'runId':chain_id,'chainId':chain_id,'toolCallId':tool_call_id,'agentId':anchor.get('agentId') or e.get('agentId'),'sessionId':e.get('sessionId') or anchor.get('sessionId'),'phase':phase,'layer':rule_layer(rule),'gateId':None,'relation':{'strength':'candidate','confidence':confidence,'basis':basis,'links':links},'evidence':refs[:6],'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
+  value={'id':aid,'aggregateKey':key,'count':1,'firstSeen':min(x.get('time',e['time']) for x in refs),'lastSeen':e['time'],'sampleEventIds':[x.get('id') for x in refs if x.get('id')],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'open','revision':1,'source':e['source'],'workload':e.get('workload'),'runId':chain_id,'chainId':chain_id,'toolCallId':tool_call_id,'agentId':anchor.get('agentId') or e.get('agentId'),'sessionId':e.get('sessionId') or anchor.get('sessionId'),'phase':phase,'hostConfirmedAt':self.clock() if phase=='host_confirmed' else None,'hostEventTime':e.get('time') if phase=='host_confirmed' else None,'layer':rule_layer(rule),'gateId':None,'relation':{'strength':'candidate','confidence':confidence,'basis':basis,'links':links},'evidence':refs[:6],'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
   c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],'open',key,compact(value)));return aid
  def upgrade_chain_alert(self,c,aid,host,link,basis):
   row=c.execute('SELECT payload FROM alerts WHERE id=?',(aid,)).fetchone()
@@ -270,7 +270,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    if len(alert.get('evidence') or [])<6:alert.setdefault('evidence',[]).append(copy)
    alert.setdefault('relation',{}).setdefault('links',[]).append(link);changed=True
   if alert.get('phase')!='host_confirmed':
-   alert['phase']='host_confirmed';alert['hostConfirmedAt']=host.get('time');alert['relation']['confidence']='correlated';alert['relation']['basis']=basis;changed=True
+   alert['phase']='host_confirmed';alert['hostConfirmedAt']=self.clock();alert['hostEventTime']=host.get('time');alert['relation']['confidence']='correlated';alert['relation']['basis']=basis;changed=True
    if alert.get('sessionId') is None and host.get('sessionId'):alert['sessionId']=host.get('sessionId')
   if not changed:return aid
   alert['revision']=alert.get('revision',1)+1;c.execute('UPDATE alerts SET payload=? WHERE id=?',(compact(alert),aid));return aid

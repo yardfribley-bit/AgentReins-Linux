@@ -25,6 +25,7 @@ UNTRUSTED_SOURCES = {
     'tool_result', 'retrieval', 'knowledge', 'document', 'upload', 'web', 'file', 'url',
 }
 _URL = re.compile(r'https?://[^\s\'"<>]+', re.I)
+_IPV4_TARGET = re.compile(r'(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])')
 _HOST_PORT = re.compile(r'\b(\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?::(\d{1,5}))?\b')
 
 
@@ -220,6 +221,13 @@ def extract_entities(tool_name, arguments):
         for match in _URL.findall(command):
             add_url(match)
         stripped = _URL.sub(' ', command)
+        # Commands without a URL (nc, ncat, socat, ssh, bash /dev/tcp) still name the
+        # destination. Only IPv4 literals are taken, since audit reports addresses.
+        for match in _IPV4_TARGET.finditer(stripped):
+            address = match.group(1)
+            if all(0 <= int(part) <= 255 for part in address.split('.')):
+                if address not in hosts:
+                    hosts.append(address)
         for match in re.findall(r'(?<![\w])(/[\w./@+\-]{2,})', stripped):
             add_path(match)
     canonical = json.dumps(parsed if parsed != arguments else arguments, ensure_ascii=False, sort_keys=True, separators=(',', ':'))

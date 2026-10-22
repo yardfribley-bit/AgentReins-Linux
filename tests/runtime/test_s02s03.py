@@ -454,3 +454,33 @@ class WatchTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BareAddressEntityTest(unittest.TestCase):
+    """Live run 2026-10-22: `nc ADDR PORT` produced no host entity, so S02 could not link."""
+
+    def test_ipv4_literal_in_command_is_host_entity(self):
+        from runtime.semantic_extract import extract_entities
+        cases = {
+            'nc -w 2 198.51.100.20 80': ['198.51.100.20'],
+            'bash -c "cat </dev/tcp/198.51.100.20/4444"': ['198.51.100.20'],
+            'tar xf v1.2.3.4.tgz; echo 10.0.0.300': [],
+        }
+        for command, hosts in cases.items():
+            self.assertEqual(extract_entities('terminal', json.dumps({'command': command}))['hosts'], hosts, command)
+
+
+class UpperFromMountinfoTest(unittest.TestCase):
+    """Live run 2026-10-22: Docker 29 + containerd image store reports GraphDriver null."""
+
+    def test_overlay_root_parsed(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
+        from upperdir_changes import overlay_from_mountinfo
+        with tempfile.TemporaryDirectory() as tmp:
+            info = Path(tmp) / 'mountinfo'
+            info.write_text(
+                '600 500 0:50 / / rw,relatime master:1 - overlay overlay rw,lowerdir=/s/1/fs:/s/2/fs,upperdir=/s/9/fs,workdir=/s/9/work\n'
+                '601 600 0:51 / /proc rw - proc proc rw\n')
+            self.assertEqual(overlay_from_mountinfo(str(info)), {'upper': '/s/9/fs', 'lower': '/s/1/fs:/s/2/fs'})
+            info.write_text('601 600 0:51 / /proc rw - proc proc rw\n')
+            self.assertIsNone(overlay_from_mountinfo(str(info)))
