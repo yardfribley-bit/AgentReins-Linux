@@ -112,6 +112,15 @@ def run(out_dir=None):
             raise SystemExit('gateway rewrote the model response')
         if status != 200:
             raise SystemExit('unexpected status %s' % status)
+        # The gateway forwards the response bytes first and writes its events right after,
+        # so under load the log can trail the HTTP reply by a moment.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if log.exists() and any(
+                    '"TOOL_CALL"' in line and 'terminal' in line
+                    for line in log.read_text().splitlines()):
+                break
+            time.sleep(0.05)
         adapter = Adapter({'agents': AGENTS['agents'], 'containerPatterns': ['target-01-.*'], 'policies': {}})
         adapter.last_docker = time.time() + 3600
         adapter.containers = {'abc123abc123': 'target-01-sandbox'}
