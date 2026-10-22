@@ -206,7 +206,7 @@ def _segments_for_tool(store, cursor, tool):
     chain = tool.get('chainId')
     if chain:
         start = float(tool.get('time') or 0) - float(tool.get('chainLookbackSeconds') or CHAIN_LOOKBACK)
-        for item in _load(cursor, tool.get('source'), start, float(tool.get('time') or 0) + 1, chain=chain):
+        for item in _load(cursor, tool.get('source'), start, float(tool.get('time') or 0) + 1, chain=chain, newest_first=True):
             prior.extend(triggering_untrusted(item.get('untrustedSegments')))
     # A flag without a stored segment is not evidence.
     return (own + prior)[:8]
@@ -228,7 +228,7 @@ def _semantic_refs(store, cursor, tool, segments):
 def _tools_before(store, cursor, host):
     start = float(host.get('time') or 0) - HOST_WINDOW
     found = []
-    for item in _load(cursor, host.get('source'), start, float(host.get('time') or 0) + 1, agent=host.get('agentId')):
+    for item in _load(cursor, host.get('source'), start, float(host.get('time') or 0) + 1, agent=host.get('agentId'), kinds=('tool',), newest_first=True):
         if item.get('kind') == 'tool' and item.get('operation') == 'TOOL_CALL' and item.get('agentId') == host.get('agentId'):
             found.append(item)
     found.sort(key=lambda item: abs(float(host.get('time') or 0) - float(item.get('time') or 0)))
@@ -239,17 +239,39 @@ def _hosts_after(store, cursor, tool):
     start = float(tool.get('time') or 0)
     end = start + HOST_WINDOW
     found = []
-    for item in _load(cursor, tool.get('source'), start, end + 1, agent=tool.get('agentId')):
+    for item in _load(cursor, tool.get('source'), start, end + 1, agent=tool.get('agentId'), kinds=('process', 'file', 'network')):
         if item.get('kind') in ('process', 'file', 'network') and item.get('agentId') == tool.get('agentId'):
             found.append(item)
     return found
 
 
-def _load(cursor, source, start, end, chain=None, agent=None):
-    rows = cursor.execute(
-        'SELECT payload FROM events WHERE source=? AND time>=? AND time<=? ORDER BY time LIMIT 400',
-        (source, start, end),
-    ).fetchall()
+LOAD_LIMIT = 400
+
+
+def _load(cursor, source, start, end, chain=None, agent=None, kinds=None, newest_first=False, limit=LOAD_LIMIT):
+    """Events of one source in [start, end], filtered in SQL before the limit.
+
+    Chain, agent and kind filters run inside the query so unrelated traffic in the
+    window cannot push the relevant events past the limit. newest_first keeps the
+    events nearest to `end` when the window still holds more than `limit`; the
+    result is always returned in ascending time order.
+    """
+    sql = 'SELECT payload FROM events WHERE source=? AND time>=? AND time<=?'
+    params = [source, start, end]
+    if kinds:
+        sql += ' AND kind IN (%s)' % ','.join('?' * len(kinds))
+        params.extend(kinds)
+    if chain is not None:
+        sql += " AND (json_extract(payload,'$.chainId')=? OR json_extract(payload,'$.runId')=?)"
+        params.extend([chain, chain])
+    if agent is not None:
+        sql += " AND json_extract(payload,'$.agentId')=?"
+        params.append(agent)
+    sql += ' ORDER BY time %s LIMIT ?' % ('DESC' if newest_first else 'ASC')
+    params.append(int(limit))
+    rows = cursor.execute(sql, params).fetchall()
+    if newest_first:
+        rows = list(reversed(rows))
     items = []
     for row in rows:
         item = json.loads(row[0])

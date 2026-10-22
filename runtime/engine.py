@@ -59,6 +59,7 @@ class Store:
    c.executescript('''PRAGMA journal_mode=WAL; PRAGMA auto_vacuum=INCREMENTAL;
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, time REAL, source TEXT, workload TEXT, kind TEXT, payload TEXT);
 CREATE INDEX IF NOT EXISTS ev_lookup ON events(workload,kind,time);
+CREATE INDEX IF NOT EXISTS ev_source_kind_time ON events(source,kind,time);
 CREATE TABLE IF NOT EXISTS alerts(id TEXT PRIMARY KEY, time REAL, rule TEXT, severity TEXT, status TEXT, fingerprint TEXT UNIQUE, payload TEXT);
 CREATE INDEX IF NOT EXISTS alert_lookup ON alerts(time);
 CREATE TABLE IF NOT EXISTS gates(id TEXT PRIMARY KEY,source TEXT,hash TEXT,request_key TEXT UNIQUE,status TEXT,deadline REAL,payload TEXT);

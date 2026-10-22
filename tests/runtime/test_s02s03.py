@@ -484,3 +484,60 @@ class UpperFromMountinfoTest(unittest.TestCase):
             self.assertEqual(overlay_from_mountinfo(str(info)), {'upper': '/s/9/fs', 'lower': '/s/1/fs:/s/2/fs'})
             info.write_text('601 600 0:51 / /proc rw - proc proc rw\n')
             self.assertIsNone(overlay_from_mountinfo(str(info)))
+
+
+class LoadWindowTests(Harness):
+    """chain_detect._load used ORDER BY time ASC LIMIT 400 before filtering, so under load
+    the newest (closest) tool call could fall outside the window it scanned."""
+
+    def test_newest_matching_tool_wins_with_over_400_events(self):
+        policy = {'allowedNetworks': ALLOWED}
+        entities = {'urls': ['http://%s/c' % C2], 'hosts': [C2], 'paths': [], 'commands': []}
+        t0 = self.now
+        self.ingest(self.model('old', 'target-01', t0), self.tool('old', 'target-01', 'http_request', entities, t0 + 1, 'call-old', policy=policy))
+        noise = []
+        for index in range(450):
+            when = t0 + 2 + index * 0.1
+            noise.append(self.host('noise-p-%d' % index, 'target-01', 'process', when, command='true %d' % index))
+            noise.append({
+                'id': 'noise-t-%d' % index, 'time': when, 'workload': 'gateway:target-01', 'kind': 'tool',
+                'operation': 'TOOL_RESULT', 'identity': {'basis': 'gateway route'}, 'agentId': 'target-01',
+                'chainId': 'noise', 'runId': 'noise', 'confidence': 'observed', 'pid': 0, 'result': 'success',
+            })
+        for offset in range(0, len(noise), 100):
+            self.ingest(*noise[offset:offset + 100])
+        t1 = t0 + 60
+        self.ingest(self.model('new', 'target-01', t1), self.tool('new', 'target-01', 'http_request', entities, t1 + 1, 'call-new', policy=policy))
+        self.ingest(self.host('net-new', 'target-01', 'network', t1 + 2, destination=C2, port=80, policy=policy))
+        s02 = self.by_rule('S02')
+        self.assertEqual([item['chainId'] for item in s02], ['new'])
+        new_s03 = [item for item in self.by_rule('S03') if item['chainId'] == 'new']
+        self.assertEqual(new_s03[0]['phase'], 'host_confirmed')
+
+    def test_hosts_after_tool_not_cut_by_other_kinds(self):
+        entities = {'urls': [], 'hosts': [], 'paths': [PATH], 'commands': []}
+        t0 = self.now
+        self.ingest(self.model('c9', 'target-02', t0), self.tool('c9', 'target-02', 'read_file', entities, t0 + 1, 'call-r'))
+        filler = [{
+            'id': 'm-%d' % index, 'time': t0 + 1.01 + index * 0.001, 'workload': 'gateway:target-02', 'kind': 'model',
+            'operation': 'MODEL_RESPONSE', 'identity': {'basis': 'gateway route'}, 'agentId': 'target-02', 'chainId': 'other',
+            'runId': 'other', 'confidence': 'observed', 'pid': 0, 'result': 'success',
+        } for index in range(450)]
+        for offset in range(0, len(filler), 100):
+            self.ingest(*filler[offset:offset + 100])
+        self.ingest(self.host('file-late', 'target-02', 'file', t0 + 5, path=PATH, access='read_open'))
+        self.assertEqual(self.by_rule('S03')[0]['phase'], 'host_confirmed')
+
+
+class ConfirmTimeTests(Harness):
+    def test_host_confirmed_at_is_server_time(self):
+        entities = {'urls': ['http://%s/c' % C2], 'hosts': [C2], 'paths': [], 'commands': []}
+        policy = {'allowedNetworks': ALLOWED}
+        self.ingest(self.model('ct', 'target-01', self.now), self.tool('ct', 'target-01', 'http_request', entities, self.now + 1, policy=policy))
+        event_time = self.now + 2
+        self.now += 7
+        self.ingest(self.host('net-ct', 'target-01', 'network', event_time, destination=C2, port=80, policy=policy))
+        for rule in ('S03', 'S02'):
+            alert = self.by_rule(rule)[0]
+            self.assertEqual(alert['hostConfirmedAt'], self.now, rule)
+            self.assertEqual(alert['hostEventTime'], event_time, rule)
