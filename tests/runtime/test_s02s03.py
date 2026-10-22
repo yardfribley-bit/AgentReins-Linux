@@ -541,3 +541,23 @@ class ConfirmTimeTests(Harness):
             alert = self.by_rule(rule)[0]
             self.assertEqual(alert['hostConfirmedAt'], self.now, rule)
             self.assertEqual(alert['hostEventTime'], event_time, rule)
+
+
+class FanotifyDedupTests(unittest.TestCase):
+    """UCloud run: one container read produced two AUDIT_FILE records, the second without a container ID."""
+
+    def test_open_then_access_keeps_first_with_container(self):
+        import importlib.util
+        sys.path.insert(0, str(ROOT / 'collector'))
+        spec = importlib.util.spec_from_file_location('host_stream_dedup', ROOT / 'collector' / 'agentreins_host_stream.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        dedup = mod.FanotifyDedup(window=2.0)
+        self.assertEqual(dedup.admit(40, '/app/.env', mod.FAN_OPEN, 'abc123', now=10.0), (True, 'abc123'))
+        self.assertEqual(dedup.admit(40, '/app/.env', mod.FAN_ACCESS, '', now=10.1), (False, 'abc123'))
+        # A write by the same pid is a different record, and inherits the container ID.
+        self.assertEqual(dedup.admit(40, '/app/.env', mod.FAN_MODIFY, '', now=10.2), (True, 'abc123'))
+        self.assertEqual(dedup.admit(40, '/app/.env', mod.FAN_CLOSE_WRITE, '', now=10.3), (False, 'abc123'))
+        # Outside the window the same access is reported again.
+        self.assertEqual(dedup.admit(40, '/app/.env', mod.FAN_OPEN, '', now=13.0), (True, ''))
+        self.assertEqual(dedup.admit(41, '/app/.env', mod.FAN_OPEN, '', now=13.0), (True, ''))

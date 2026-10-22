@@ -409,6 +409,37 @@ def fanotify_records(path, pid, mask, ppid=0, cmdline="", container_id=""):
     return records
 
 
+class FanotifyDedup:
+    """One read emits FAN_OPEN then FAN_ACCESS (a write emits MODIFY then CLOSE_WRITE).
+    The later event often arrives after a short-lived process exited, so its container
+    lookup comes back empty. Keep one record per (pid, path, access) within a short
+    window, and reuse the container ID seen first for that pid."""
+
+    def __init__(self, window=2.0, limit=4096):
+        self.window = window
+        self.limit = limit
+        self.seen = {}
+        self.containers = {}
+
+    def admit(self, pid, path, mask, container_id, now=None):
+        now = time.monotonic() if now is None else now
+        if len(self.seen) > self.limit:
+            cutoff = now - self.window
+            self.seen = {k: v for k, v in self.seen.items() if v >= cutoff}
+            self.containers = {k: v for k, v in self.containers.items() if v[1] >= cutoff}
+        if container_id:
+            self.containers[pid] = (container_id, now)
+        elif pid in self.containers and now - self.containers[pid][1] <= self.window:
+            container_id = self.containers[pid][0]
+        write = bool(mask & (FAN_MODIFY | FAN_CLOSE_WRITE))
+        key = (pid, path, write)
+        last = self.seen.get(key)
+        self.seen[key] = now
+        if last is not None and now - last <= self.window:
+            return False, container_id
+        return True, container_id
+
+
 def fanotify_stream(cfg: argparse.Namespace) -> None:
     paths = [p for p in (getattr(cfg, "fanotify", None) or []) if p and os.path.exists(p)]
     if not paths:
@@ -427,6 +458,7 @@ def fanotify_stream(cfg: argparse.Namespace) -> None:
         if libc.fanotify_mark(fd, FAN_MARK_ADD, mask, -100, path.encode()) != 0:
             print("fanotify_mark %s failed: %s" % (path, os.strerror(ctypes.get_errno())), flush=True)
     print("fanotify watching %s" % ",".join(paths), flush=True)
+    dedup = FanotifyDedup()
     while True:
         try:
             buf = os.read(fd, 8192)
@@ -451,7 +483,9 @@ def fanotify_stream(cfg: argparse.Namespace) -> None:
             cmdline = read_cmdline(epid)
             if any(skip in cmdline for skip in ("sensor.py", "audit_bridge.py", "agentreins_host_stream.py")):
                 continue
-            cid = container_of(epid)
+            admit, cid = dedup.admit(epid, path, event_mask, container_of(epid))
+            if not admit:
+                continue
             for record in fanotify_records(path, epid, event_mask, read_ppid(epid), cmdline, cid):
                 emit(record)
 
