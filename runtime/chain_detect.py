@@ -1,16 +1,20 @@
 """S02/S03 correlation. Time proximity is only a constraint, never a reason to link.
 
 Semantic stage: an observed untrusted segment, then a high-risk tool call on the
-same chain. Host stage: an argument entity equals a host event for the same
-agent. Inferred first-token matches are not recorded as links.
+same chain. A shell-named tool whose only reason is tool_name does not open S03
+until a correlated host event is itself risky (dangerous command, sensitive
+path, or a non-allowlisted connection). A matching benign process such as
+uptime is not confirmation. Host stage: an argument entity equals a host event
+for the same agent, and that record confirms only the nearest such tool call.
+Inferred first-token matches are not recorded as links.
 """
 import json
 import urllib.parse
 
 try:
-    from runtime.semantic_extract import high_risk_reasons, triggering_untrusted
+    from runtime.semantic_extract import extract_entities, high_risk_reasons, triggering_untrusted
 except ImportError:
-    from semantic_extract import high_risk_reasons, triggering_untrusted
+    from semantic_extract import extract_entities, high_risk_reasons, triggering_untrusted
 
 HOST_WINDOW = 120
 CHAIN_LOOKBACK = 3600
@@ -24,13 +28,21 @@ def observe(store, cursor, event):
         _confirm_from_host(store, cursor, event)
 
 
-def _semantic(store, cursor, event):
+def _semantic(store, cursor, event, host=None):
     segments = _segments_for_tool(store, cursor, event)
     if not segments:
         return None
     reasons = _reasons(event)
     if not reasons:
         return None
+    confirming = None
+    if _tool_name_only(reasons):
+        # A shell name alone is every normal step after a knowledge segment: a 630s
+        # benign run opened 290 semantic S03s on `uptime`. Open only once a correlated
+        # host event is itself risky. A matching `uptime` process is not.
+        confirming = _shell_name_confirmed(store, cursor, event, host)
+        if confirming is None:
+            return None
     basis = '不受信片段与高风险工具调用在同一 chainId 上对齐（' + ','.join(reasons) + '）；不是提示注入判定'
     links = [{
         'from': 'untrustedSegment',
@@ -44,6 +56,12 @@ def _semantic(store, cursor, event):
         '可疑模型到命令执行链',
         phase='semantic', confidence='correlated', basis=basis, links=links,
     )
+    if alert_id and confirming is not None:
+        match = match_host(event, confirming)
+        if match and match[0] == 'correlated' and _is_best(store, cursor, event, confirming):
+            _upgrade(store, cursor, alert_id, event, confirming, match[1])
+            if confirming.get('kind') == 'network':
+                _maybe_s02(store, cursor, event, confirming, segments, match[1])
     if alert_id:
         _confirm_forward(store, cursor, event, alert_id, segments)
     return alert_id
@@ -52,30 +70,37 @@ def _semantic(store, cursor, event):
 def _confirm_from_host(store, cursor, host):
     if not host.get('agentId'):
         return None
-    for tool in _tools_before(store, cursor, host):
-        segments = _segments_for_tool(store, cursor, tool)
-        if not segments:
-            continue
-        match = match_host(tool, host)
-        if not match:
-            continue
-        confidence, basis = match
-        if confidence != 'correlated':
-            continue
-        alert_id = _semantic(store, cursor, tool)
-        if not alert_id:
-            continue
-        _upgrade(store, cursor, alert_id, tool, host, basis)
-        if host.get('kind') == 'network':
-            _maybe_s02(store, cursor, tool, host, segments, basis)
-        return alert_id
+    tool = _best_tool(store, cursor, host)
+    if not tool:
+        return None
+    # Opening and upgrading go through _semantic so a shell-name-only call still
+    # has to clear the risky-host check, and only this nearest tool is confirmed.
+    return _semantic(store, cursor, tool, host=host)
+
+
+def _best_tool(store, cursor, host):
+    """The nearest correlated tool call that already has an untrusted segment.
+
+    One host record must not upgrade every older call that names the same entity.
+    """
+    for candidate in _tools_before(store, cursor, host):
+        match = match_host(candidate, host)
+        if match and match[0] == 'correlated' and _segments_for_tool(store, cursor, candidate):
+            return candidate
     return None
+
+
+def _is_best(store, cursor, tool, host):
+    best = _best_tool(store, cursor, host)
+    return best is None or best.get('id') == tool.get('id')
 
 
 def _confirm_forward(store, cursor, tool, alert_id, segments):
     for host in _hosts_after(store, cursor, tool):
         match = match_host(tool, host)
         if not match or match[0] != 'correlated':
+            continue
+        if not _is_best(store, cursor, tool, host):
             continue
         _upgrade(store, cursor, alert_id, tool, host, match[1])
         if host.get('kind') == 'network':
@@ -196,6 +221,70 @@ def _reasons(event):
     entities = dict(event.get('argsEntities') or {})
     entities.setdefault('urls', [])
     return high_risk_reasons(event.get('toolName'), entities, (event.get('policy') or {}).get('allowedNetworks'))
+
+
+def _tool_name_only(reasons):
+    return list(reasons) == ['tool_name']
+
+
+# shell_command is "a long shell invocation". That is the uptime false positive
+# once the process is recorded as `sh -c uptime`, so it does not confirm S03.
+_CONFIRMING_REASONS = ('sensitive_or_persist_path', 'command_pattern', 'non_allowlisted_destination')
+
+
+def _shell_name_confirmed(store, cursor, tool, host):
+    """The risky host event that may open a deferred shell-name S03, or None."""
+    if host is not None:
+        return host if _host_event_risky(host) else None
+    return _confirming_host(store, cursor, tool)
+
+
+def _confirming_host(store, cursor, tool):
+    for host in _hosts_after(store, cursor, tool):
+        match = match_host(tool, host)
+        if not match or match[0] != 'correlated' or not _host_event_risky(host):
+            continue
+        if _is_best(store, cursor, tool, host):
+            return host
+    return None
+
+
+def _host_event_risky(host):
+    """A benign echo of the tool command is not host confirmation."""
+    if not host:
+        return False
+    kind = host.get('kind')
+    if kind == 'network':
+        try:
+            from runtime.engine import network_allowed
+        except ImportError:
+            from engine import network_allowed
+        allowed = (host.get('policy') or {}).get('allowedNetworks')
+        if not (isinstance(allowed, list) and allowed):
+            return False
+        return not network_allowed(host.get('destination'), host.get('port'), allowed)
+    if kind == 'file':
+        try:
+            from runtime.engine import persistence_path, sensitive_path
+        except ImportError:
+            from engine import persistence_path, sensitive_path
+        path = host.get('path') or ''
+        return bool(path and (sensitive_path(path) or persistence_path(path)))
+    if kind != 'process':
+        return False
+    command = host.get('command') or ''
+    entities = extract_entities('', {'command': command}) if command else {}
+    paths = list(entities.get('paths') or [])
+    for path in list(host.get('execPaths') or []) + ([host.get('path')] if host.get('path') else []):
+        if path and path not in paths:
+            paths.append(path)
+    probed = {
+        'urls': entities.get('urls') or [],
+        'hosts': entities.get('hosts') or [],
+        'paths': paths,
+        'commands': [command] if command else [],
+    }
+    return any(reason in _CONFIRMING_REASONS for reason in high_risk_reasons('', probed, None))
 
 
 def _segments_for_tool(store, cursor, tool):

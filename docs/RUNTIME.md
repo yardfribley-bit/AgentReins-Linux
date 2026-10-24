@@ -78,9 +78,9 @@ curl/wget 显式输出参数与远端默认文件名优先于 shell stdout 重�
 
 不受信只看来源类别：role 为 tool，或 source 属于 tool_result、retrieval、knowledge、document、upload、web、file、url，或内容块类型为 file、input_file、document、image_url。system、developer、assistant，以及没有来源标记的 user，视为受信。未知角色的置信度为 unknown，传感器不入库，因此不触发。
 
-高风险工具包括名称含 terminal、shell、code_interpreter、bash、powershell、code_exec、command、exec 的调用，敏感或持久化路径，以及 curl、wget、已有危险命令模式或较长的 shell 命令。非白名单 URL 只在该工具事件带有非空 allowedNetworks 时计入高风险。
+高风险工具包括名称含 terminal、shell、code_interpreter、bash、powershell、code_exec、command、exec 的调用，敏感或持久化路径，以及 curl、wget、已有危险命令模式或较长的 shell 命令。非白名单 URL 只在该工具事件带有非空 allowedNetworks 时计入高风险。只有工具名这一条理由时，语义段不打开 S03：良性命令（例如 `uptime`）在主机上出现相同进程也不打开。要等同一 agent 上相关联的主机事件本身危险（危险命令、敏感或持久化路径，或落在已配置允许范围之外的连接）才打开，phase 直接记到 host_confirmed。
 
-主机匹配要求路径相等、URL 主机名等于目的地址、主机实体（可带端口）一致，或命令规范化后互为足够长的子串。只比较第一个 token 不算关联。主机事件必须落在工具调用之后 120 秒内；向前查找不受信片段的窗口是 3600 秒。这两段时间只是约束。置信度使用 observed、correlated、inferred、unknown；触发边记为 correlated。inferred 不作为触发条件。S03 语义段先告警，主机段把同一条告警的 phase 从 semantic 升为 host_confirmed，并写入 hostConfirmedAt。级别不因此提高。S02 是另一条告警，phase 直接为 host_confirmed。
+主机匹配要求路径相等、URL 主机名等于目的地址、主机实体（可带端口）一致，或命令规范化后互为足够长的子串。只比较第一个 token 不算关联。主机事件必须落在工具调用之后 120 秒内；向前查找不受信片段的窗口是 3600 秒。这两段时间只是约束。置信度使用 observed、correlated、inferred、unknown；触发边记为 correlated。inferred 不作为触发条件。除了上面只剩工具名的情况，S03 语义段先告警，主机段把同一条告警的 phase 从 semantic 升为 host_confirmed，并写入 hostConfirmedAt。一条主机事件只确认时间最近的那一次相关联工具调用。级别不因此提高。S02 是另一条告警，phase 直接为 host_confirmed。
 
 语义事件入库前截断到 8 KiB。网关不再写完整提示词：MODEL_REQUEST 只保留角色、计数和最多 512 字的摘录；TOOL_CALL 保留清洗后的参数，截断到 4 KiB，控制台仍能按工具参数做候选关联。
 

