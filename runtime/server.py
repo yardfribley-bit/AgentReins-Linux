@@ -3,11 +3,13 @@
 import hashlib,hmac,json,os,time,urllib.parse,threading
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
-try:from .engine import Store,RULES,Conflict,compact
-except ImportError:from engine import Store,RULES,Conflict,compact
+try:from .engine import Store,Conflict,compact
+except ImportError:from engine import Store,Conflict,compact
+try:from .observe_api import Observe
+except ImportError:from observe_api import Observe
 class App:
  def __init__(self,root,config):
-  self.root=Path(root);self.config=config;self.store=Store(config['database'],config=config);self.failures={};self.lock=threading.Lock();self.stop=threading.Event()
+  self.root=Path(root);self.config=config;self.store=Store(config['database'],config=config);self.failures={};self.lock=threading.Lock();self.stop=threading.Event();self.observe=Observe(self);self.store.on_change=self.observe.on_change
   self.maintenance=threading.Thread(target=self.maintain,daemon=True);self.maintenance.start()
  def maintain(self):
   while not self.stop.wait(2):
@@ -21,6 +23,8 @@ class App:
   for name,operator_key in operators.items():
    if hmac.compare_digest(key,operator_key):return {'role':'operator','name':name}
   if self.config.get('operatorToken') and hmac.compare_digest(key,self.config['operatorToken']):return {'role':'operator','name':self.config.get('operatorName','site-operator')}
+  for name,referee_key in (self.config.get('referees') or {}).items():
+   if hmac.compare_digest(key,referee_key):return {'role':'referee','name':name}
   for source,token in self.config['sources'].items():
    if hmac.compare_digest(key,token):return {'role':'sensor','name':source}
   return None
@@ -44,7 +48,10 @@ class App:
       value=app.failures.setdefault(ip,{'start':now,'count':0});value['count']+=1
       if value['count']>15:return None,True
     return None,False
-   def do_HEAD(self):self.do_GET()
+   def do_HEAD(self):
+    if urllib.parse.urlsplit(self.path).path.rstrip('/')=='/runtime/api/v2/stream':
+     self.send_response(200);self.send_header('Content-Type','text/event-stream; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('Content-Length','0');self.end_headers();return
+    self.do_GET()
    def do_GET(self):
     try:
      url=urllib.parse.urlsplit(self.path);path=url.path;q=urllib.parse.parse_qs(url.query)
@@ -62,7 +69,7 @@ class App:
       if not principal or principal['role']!='operator':
        data={k:data[k] for k in ('total','offset','limit','stats','serverTime')} | {'items':[{k:a.get(k) for k in ('id','rule','severity','status','createdAt','count','firstSeen','lastSeen')} for a in data['items']],'sources':[],'coverageSummary':{state:sum(x.get('state')==state for x in data['sources']) for state in ('online','degraded','offline')},'publicSummary':True}
       data['version']=app.config.get('version','runtime-1.1');return self.send(200,data)
-     if path=='/runtime/api/rules':return self.send(200,{'items':RULES,'intelligence':app.store.intelligence() if principal and principal['role']=='operator' else []})
+     if path=='/runtime/api/rules':return self.send(200,app.observe.rules(principal))
      if path=='/runtime/api/me':
       p=app.principal(self.headers);return self.send(200,{'role':p['role'] if p else 'viewer','name':p['name'] if p else '公开只读'})
      if path.startswith('/runtime/api/alerts/'):
@@ -72,6 +79,9 @@ class App:
       p=app.principal(self.headers)
       if not p or p['role']!='sensor':return self.send(403,{'error':'需要执行器凭证'})
       return self.send(200,app.store.gate_get(p['name'],path.rsplit('/',1)[-1]))
+     if path.startswith('/runtime/api/v2/') or path.rstrip('/')=='/runtime/api/v2':
+      if path.rstrip('/')=='/runtime/api/v2/stream':return app.observe.stream(self,principal)
+      status,payload=app.observe.dispatch(path,q,principal);return self.send(status,payload)
      return self.send(404,{'error':'不存在'})
     except KeyError as e:self.send(404,{'error':str(e)})
     except ValueError as e:self.send(400,{'error':str(e)[:200]})
@@ -97,6 +107,7 @@ class App:
        if parts[5]=='claim':return self.send(200,app.store.claim(p['name'],gid,body.get('hash','')))
        if parts[5]=='complete':return self.send(200,app.store.complete(p['name'],gid,body))
       return self.send(403,{'error':'采集器无人工处置权限'})
+     if p['role']!='operator':return self.send(403,{'error':'该身份只读，不能处置、放行或加白'})
      if path.startswith('/runtime/api/alerts/') and path.endswith('/review'):
       return self.send(200,app.store.review(path.split('/')[-2],body,p['name']))
      if path.startswith('/runtime/api/intelligence/') and path.endswith('/accept'):
@@ -110,4 +121,4 @@ class App:
   return H
 if __name__=='__main__':
  config=json.loads(Path(os.environ.get('AGENTREINS_RUNTIME_CONFIG','/etc/agentreins-runtime/config.json')).read_text());app=App(Path(__file__).parent,config)
- ThreadingHTTPServer((config.get('bind','127.0.0.1'),config.get('port',18920)),app.handler()).serve_forever()
+ server=ThreadingHTTPServer((config.get('bind','127.0.0.1'),config.get('port',18920)),app.handler());server.daemon_threads=True;server.serve_forever()

@@ -12,7 +12,7 @@
   [![Status](https://img.shields.io/badge/status-active_development-2563EB)](#)
 
   [任务驾驶舱](https://www.agentreins.info/pentagi) ·
-  [观测控制台](https://www.agentreins.info/console) ·
+  [观测台](https://www.agentreins.info/observe/) ·
   [部署指南](docs/OBSERVABILITY-CONSOLE.md) ·
   [Architecture](docs/ARCHITECTURE.md) ·
   [Natural-Language Policy](docs/NATURAL-LANGUAGE-POLICY.md)
@@ -40,7 +40,7 @@ AgentReins Linux 持续解析进程血缘、远程指令、文件访问、网络
 
 - [Dify 执行观测](https://www.agentreins.info/dify)：按任务查看模型、工具、执行器、命令、内核和输出文件。
 - [PentAGI 任务驾驶舱](https://www.agentreins.info/pentagi)：按“目标输入 → 模型反馈 → 沙箱行动 → 执行结果 → 边界信号”阅读一次行动。
-- [通用观测控制台](https://www.agentreins.info/console)：搜索命令、容器、事件类型及时间范围，按需查看进程时间线。
+- [观测台](https://www.agentreins.info/observe/)：只读展示总览、调用链、告警和演练计分。构建与 nginx 见 [web/README.md](web/README.md)。
 - 企业联系邮箱：[smithjat@agentreins.info](mailto:smithjat@agentreins.info)。
 
 ## 本次更新：模型到命令的执行过程
@@ -130,6 +130,7 @@ sudo tail -f /var/log/agentreins/host.jsonl
 ```text
 collector/   宿主采集、audit 桥、模型语义网关、标准化与推送
 console/     通用控制台、PentAGI 驾驶舱、历史索引与候选关联
+web/         观测台前端，构建后由 nginx 挂在 /observe/
 policy/      自然语言编译、Policy IR、AgentSpec 兼容与策略验证
 deploy/      主机服务和持续运行配置
 docs/        架构、调查方法与历史证据存档

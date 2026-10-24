@@ -1,0 +1,28 @@
+# Observe UI. Put this in the same HTTPS server as deploy/nginx-runtime.conf.example.
+# Static files:
+#   /opt/agentreins-web/releases/<commit>/   vite dist
+#   /opt/agentreins-web/current -> releases/<commit>
+# Runtime stays on 127.0.0.1:18920. This file does not reload nginx.
+
+location = /observe { return 301 /observe/; }
+
+location ^~ /observe/ {
+    alias /opt/agentreins-web/current/;
+    index index.html;
+    try_files $uri $uri/ /observe/index.html;
+}
+
+# Longer match than location ^~ /runtime/ so the 30s read timeout there
+# does not apply. proxy_buffering must stay off for SSE.
+location = /runtime/api/v2/stream {
+    proxy_pass http://127.0.0.1:18920;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 1h;
+    gzip off;
+    add_header X-Accel-Buffering no;
+}
