@@ -54,7 +54,7 @@ def clean(v):
 class Conflict(ValueError):pass
 class Store:
  def __init__(self,path,clock=time.time,config=None):
-  self.config=config or {};self.last_ingest={};self.path=str(path);self.clock=clock;Path(path).parent.mkdir(parents=True,exist_ok=True)
+  self.config=config or {};self.last_ingest={};self.path=str(path);self.clock=clock;self.on_change=None;Path(path).parent.mkdir(parents=True,exist_ok=True)
   with self.db() as c:
    c.executescript('''PRAGMA journal_mode=WAL; PRAGMA auto_vacuum=INCREMENTAL;
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, time REAL, source TEXT, workload TEXT, kind TEXT, payload TEXT);
@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS intel(id TEXT PRIMARY KEY,time REAL,payload TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
 CREATE TABLE IF NOT EXISTS coverage_losses(source TEXT,time REAL,audit INTEGER,sensor INTEGER);
 CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
+CREATE INDEX IF NOT EXISTS ev_chain_time ON events(json_extract(payload,'$.chainId'), time);
+CREATE TABLE IF NOT EXISTS tool_baselines(agent_id TEXT, tool_name TEXT, first_seen REAL, last_seen REAL, calls INTEGER, PRIMARY KEY(agent_id, tool_name));
 ''')
    c.execute('PRAGMA max_page_count=65536')
  @contextlib.contextmanager
@@ -83,6 +85,24 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    yield c;c.commit()
   except BaseException:c.rollback();raise
   finally:c.close()
+ def _emit(self,kind,payload):
+  cb=getattr(self,'on_change',None)
+  if not cb:return
+  try:cb(kind,payload)
+  except Exception:pass
+ def _emit_coverage(self,source,now):
+  if not getattr(self,'on_change',None):return
+  try:
+   with self.db(write=False) as c:cov=self.coverage(c,source)
+   self._emit('coverage',{'source':source,'state':cov.get('state'),'degraded':bool(cov.get('degraded')),'receivedAt':now})
+  except Exception:
+   self._emit('heartbeat',{'source':source,'receivedAt':now})
+ def _baseline(self,c,e):
+  if e.get('kind')!='tool' or e.get('operation')!='TOOL_CALL':return
+  agent,name=e.get('agentId'),e.get('toolName')
+  if not agent or not name:return
+  seen=float(e.get('time') or 0)
+  c.execute('INSERT INTO tool_baselines(agent_id,tool_name,first_seen,last_seen,calls) VALUES(?,?,?,?,1) ON CONFLICT(agent_id,tool_name) DO UPDATE SET last_seen=excluded.last_seen, calls=tool_baselines.calls+1',(str(agent)[:160],str(name)[:160],seen,seen))
  def heartbeat(self,source,body):
   now=self.clock();body=clean(body);body.update(source=source,receivedAt=now)
   body['serverRejected']=self.last_ingest.get(source,{}).get('rejectedTotal',0)
@@ -95,6 +115,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    c.execute('DELETE FROM coverage_losses WHERE time<?',(now-86400,))
    if prev and now-prev['seen']>35:c.execute('INSERT OR REPLACE INTO gaps VALUES(?,?,?)',(source,prev['seen']+35,now))
    c.execute('INSERT OR REPLACE INTO sources VALUES(?,?,?)',(source,now,compact(body)))
+  self._emit_coverage(source,now)
  def coverage(self,c,source):
   row=c.execute('SELECT * FROM sources WHERE id=?',(source,)).fetchone();now=self.clock()
   if not row:return {'source':source,'state':'unknown','layers':{},'limitations':['未收到独立心跳']}
@@ -142,7 +163,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
       if e.get('sha256After'):digest_info['after']=e.get('sha256After')
       if e.get('size') is not None:digest_info['size']=e.get('size')
       existing['fileDigest']=digest_info
-     c.execute('UPDATE alerts SET payload=? WHERE id=?',(compact(existing),old['id']));return old['id']
+     c.execute('UPDATE alerts SET payload=? WHERE id=?',(compact(existing),old['id']));self._emit('alert',existing);return old['id']
     if existing.get('aggregateKey')==aggregate and e['id'] in existing.get('sampleEventIds',[]):return old['id']
   else:aggregate=None
   key=digest([rule,e['source'],e['id'],gate_id]);aid='al_'+key[:24];coverage=self.coverage(c,e['source'])
@@ -154,7 +175,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
   value['layer']=rule_layer(rule)
   if e.get('secretFindings'):value['secretFindings']=[{'category':x.get('category'),'digest':x.get('digest')} for x in e['secretFindings'][:16] if isinstance(x,dict) and x.get('category') and x.get('digest')]
   if e.get('sha256Before') or e.get('sha256After'):value['fileDigest']={'before':e.get('sha256Before'),'after':e.get('sha256After'),'size':e.get('size')}
-  c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],value['status'],key,compact(value)));return aid
+  c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],value['status'],key,compact(value)));self._emit('alert',value);return aid
  def ingest(self,source,items):
   if not isinstance(items,list):raise ValueError('events 必须为数组')
   if len(items)>100:raise ValueError('最多 100 条事件')
@@ -193,7 +214,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
     except (ValueError,TypeError,AttributeError):rejected.append({'index':index,'reason':'事件字段、身份或时间无效'})
    for e in sorted(valid,key=lambda x:x['time']):
     if c.execute('INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?)',(e['id'],e['time'],source,e['workload'],e['kind'],compact(e))).rowcount:
-     added+=1;self.detect(c,e)
+     added+=1;self._baseline(c,e);self.detect(c,e)
    previous=self.last_ingest.get(source,{}).get('rejectedTotal',0)
    self.last_ingest[source]={'rejected':rejected,'rejectedTotal':previous+len(rejected),'acknowledged':len(items)}
    # Late audit records can arrive after their corresponding execution.
@@ -260,7 +281,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
   if found:return found
   key=digest(['chain',rule,e['source'],chain_id,tool_call_id or e.get('id')]);aid='al_'+key[:24];coverage=self.coverage(c,e['source'])
   value={'id':aid,'aggregateKey':key,'count':1,'firstSeen':min(x.get('time',e['time']) for x in refs),'lastSeen':e['time'],'sampleEventIds':[x.get('id') for x in refs if x.get('id')],'createdAt':self.clock(),'rule':rule,'ruleVersion':spec['version'],'severity':spec['severity'],'title':title,'status':'open','revision':1,'source':e['source'],'workload':e.get('workload'),'runId':chain_id,'chainId':chain_id,'toolCallId':tool_call_id,'agentId':anchor.get('agentId') or e.get('agentId'),'sessionId':e.get('sessionId') or anchor.get('sessionId'),'phase':phase,'hostConfirmedAt':self.clock() if phase=='host_confirmed' else None,'hostEventTime':e.get('time') if phase=='host_confirmed' else None,'layer':rule_layer(rule),'gateId':None,'relation':{'strength':'candidate','confidence':confidence,'basis':basis,'links':links},'evidence':refs[:6],'coverageAtDetection':coverage,'limitations':[spec['limitation']],'ruleSnapshot':spec}
-  c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],'open',key,compact(value)));return aid
+  c.execute('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?)',(aid,value['createdAt'],rule,spec['severity'],'open',key,compact(value)));self._emit('alert',value);return aid
  def upgrade_chain_alert(self,c,aid,host,link,basis):
   row=c.execute('SELECT payload FROM alerts WHERE id=?',(aid,)).fetchone()
   if not row:return None
@@ -274,7 +295,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    alert['phase']='host_confirmed';alert['hostConfirmedAt']=self.clock();alert['hostEventTime']=host.get('time');alert['relation']['confidence']='correlated';alert['relation']['basis']=basis;changed=True
    if alert.get('sessionId') is None and host.get('sessionId'):alert['sessionId']=host.get('sessionId')
   if not changed:return aid
-  alert['revision']=alert.get('revision',1)+1;c.execute('UPDATE alerts SET payload=? WHERE id=?',(compact(alert),aid));return aid
+  alert['revision']=alert.get('revision',1)+1;c.execute('UPDATE alerts SET payload=? WHERE id=?',(compact(alert),aid));self._emit('s03_upgrade' if alert.get('rule')=='S03' and alert.get('phase')=='host_confirmed' else 'alert',alert);return aid
  def _find_chain_alert(self,c,rule,source,chain_id,tool_call_id):
   if not chain_id:return None
   for row in c.execute('SELECT id,payload FROM alerts WHERE rule=? AND time>? ORDER BY time DESC LIMIT 300',(rule,self.clock()-7*86400)).fetchall():
@@ -395,7 +416,7 @@ CREATE INDEX IF NOT EXISTS coverage_loss_time ON coverage_losses(source,time);
    for key in ('rule','severity','status'):
     v=q.get(key,[''])[0]
     if v:where.append(key+'=?');params.append(v)
-   for key in ('chainId','agentId','layer'):
+   for key in ('chainId','agentId','layer','phase'):
     v=str(q.get(key,[''])[0] or '')
     if v:where.append("json_extract(payload,'$."+key+"')=?");params.append(v)
    query=q.get('q',[''])[0]

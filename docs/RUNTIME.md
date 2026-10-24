@@ -167,3 +167,9 @@ PYTHONPATH=. python3 scripts/false_alarm_baseline.py /tmp/cap-baseline
 3. 编辑 `/etc/agentreins/agents.yaml` 的 inbound，把样例里的 `.invalid` 和 RFC 5737 网段换成这台机器的 vhost 和网桥。不要把真实地址提交回仓库。
 4. 需要 S14、S15、S22 或知识库标记时再写入对应字段。S20 要给应用容器单独的 pattern 和 role，不要把数据库容器标成 api。
 5. 传感器版本字符串是 `runtime-1.4-http`。重启 runtime、sensor 和语义网关后，新规则才会出现在 `/runtime/api/rules`。
+
+## 观测台（只读，2026-10-24）
+
+展示面在仓库的 `web/`，构建后由 nginx 以 `/observe/` 提供，不并进旧的 `/console` 页面。runtime 增加只读的 `/runtime/api/v2/overview`、`chains`、`agents`、`alerts`、`coverage`、`drill` 和 `stream`。SSE 不带 `Connection: close`，nginx 要对 `/runtime/api/v2/stream` 单独关掉缓冲。原有 `/runtime/api/heartbeat` 与 `/ingest` 不变。
+
+`/runtime/api/rules` 增加 ASI 映射和启用状态。`config.json` 可增加 `referees`（只读，不能处置）、`drillFile`、`agentsFile`。剧本时间窗写在 `drill.yaml`，页面不提供登记按钮。匿名调用链只返回 `runtime/replay_dataset.json` 里的脱敏样例。部署路径和 nginx 片段见 [web/README.md](../web/README.md)。
